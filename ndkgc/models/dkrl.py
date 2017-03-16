@@ -9,8 +9,9 @@ import tensorflow.contrib.layers as layers
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
 
 from ndkgc.ops import get_lookup_table, corrupt_single_relationship, corrupt_single_entity, content_lookup, \
-    multiple_content_lookup, normalized_lookup
-from ndkgc.utils import count_line, valid_vocab_file, load_list, load_triples, load_pretrained_embedding, load_content
+    multiple_content_lookup, normalized_lookup, avg_grads
+from ndkgc.utils import count_line, valid_vocab_file, load_list, \
+    load_triples, load_pretrained_embedding, load_content
 
 
 class DKRL(object):
@@ -212,27 +213,28 @@ class DKRL(object):
                                                                     self.word_embedding,
                                                                     triples]):
             print("inference triples shape", triples.get_shape())
-            heads, rels, tails = tf.unstack(triples, axis=1, name='unstack_hrt')
 
-            heads_embed = normalized_lookup(self.entity_embedding,
-                                            heads,
-                                            name='head_embedding_lookup')
-            rels_embed = normalized_lookup(self.relation_embedding,
-                                           rels,
-                                           name='relation_embedding_lookup')
-            tails_embed = normalized_lookup(self.entity_embedding,
-                                            tails,
-                                            name='tail_embedding_lookup')
+            with tf.device('/cpu:0'):
+                heads, rels, tails = tf.unstack(triples, axis=1, name='unstack_hrt')
+
+                heads_embed = normalized_lookup(self.entity_embedding,
+                                                heads,
+                                                name='head_embedding_lookup')
+                rels_embed = normalized_lookup(self.relation_embedding,
+                                               rels,
+                                               name='relation_embedding_lookup')
+                tails_embed = normalized_lookup(self.entity_embedding,
+                                                tails,
+                                                name='tail_embedding_lookup')
+                # [batch_size, ?, word_embedding_size]
+                heads_content = normalized_lookup(self.word_embedding, head_content_ids,
+                                                  name='head_content_lookup')
+                # [batch_size, ?, word_embedding_size]
+                tails_content = normalized_lookup(self.word_embedding, tail_content_ids,
+                                                  name='tail_content_lookup')
 
             # First, |h + r - t| for h,r,t all using structural embeddings
             structural_hrt_score = self.dist(heads_embed, rels_embed, tails_embed)
-
-            # [batch_size, ?, word_embedding_size]
-            heads_content = normalized_lookup(self.word_embedding, head_content_ids,
-                                              name='head_content_lookup')
-            # [batch_size, ?, word_embedding_size]
-            tails_content = normalized_lookup(self.word_embedding, tail_content_ids,
-                                              name='tail_content_lookup')
 
             # Convolution Layers
 
@@ -377,13 +379,15 @@ class DKRL(object):
                                               self.triple_matrix,
                                               self.content_matrix, self.vocab_table]):
             with tf.device('/cpu:0'):
-                input_triples = tf.train.limit_epochs(tf.random_shuffle(self.train_matrix, name='shuffled_input_triples'),
-                                                      num_epochs=num_epochs,
-                                                      name='train_triples_limited')
+                input_triples = tf.train.limit_epochs(
+                    tf.random_shuffle(self.train_matrix, name='shuffled_input_triples'),
+                    num_epochs=num_epochs,
+                    name='train_triples_limited')
                 single_triple = tf.train.shuffle_batch([input_triples],
                                                        batch_size=1,
-                                                       capacity=batch_size * 40,
-                                                       min_after_dequeue=batch_size * 10,
+                                                       capacity=min(batch_size * 40, self.train_matrix.get_shape()[0]),
+                                                       min_after_dequeue=min(batch_size * 15,
+                                                                             self.train_matrix.get_shape()[0]),
                                                        enqueue_many=True,
                                                        allow_smaller_final_batch=True,
                                                        name='train_shuffle_batch')
@@ -425,7 +429,7 @@ class DKRL(object):
                 corrupted_tail_content_len = tf.shape(corrupted_tail_content_id)[0]
 
                 # Get content information for
-
+                #TODO: Change to tf.contrib.training.bucket_by_sequence_length
                 input_queue = tf.train.batch([single_triple,
                                               entity_corrupted_triple,
                                               relation_corrupted_triple,
@@ -435,7 +439,7 @@ class DKRL(object):
                                               corrupted_tail_content_id, corrupted_tail_content_len],
                                              batch_size=batch_size * 4,
                                              num_threads=4,
-                                             capacity=batch_size * 40,
+                                             capacity=min(batch_size * 40, self.train_matrix.get_shape()[0]),
                                              enqueue_many=False,
                                              shapes=[[3], [3], [3],
                                                      [None], (),
@@ -455,41 +459,54 @@ class DKRL(object):
                 head_content_ids_batch, head_content_len_batch, \
                 tail_content_ids_batch, tail_content_len_batch, \
                 corrupted_head_content_id_batch, corrupted_head_content_len_batch, \
-                corrupted_tail_content_id_batch, corrupted_tail_content_len_batch = [tf.split(x, 4) for x in input_queue]
+                corrupted_tail_content_id_batch, corrupted_tail_content_len_batch = [tf.split(x, 4) for x in
+                                                                                     input_queue]
 
+                optimizer = tf.train.AdamOptimizer(self.lr)
 
+                tower_grads = list()
+                losses = list()
 
+            for gpu_id in range(4):
+                with tf.device('/gpu:%d' % gpu_id):
+                    triple_score = self.inference(triples=triple_batch[gpu_id],
+                                                  head_content_ids=head_content_ids_batch[gpu_id],
+                                                  head_content_len=head_content_len_batch[gpu_id],
+                                                  tail_content_ids=tail_content_ids_batch[gpu_id],
+                                                  tail_content_len=tail_content_len_batch[gpu_id],
+                                                  variable_scope=self.__model_scope)
 
+                    entity_corrupted_triple_score = self.inference(triples=entity_corrupted_triple_batch[gpu_id],
+                                                                   head_content_ids=corrupted_head_content_id_batch[
+                                                                       gpu_id],
+                                                                   head_content_len=corrupted_head_content_len_batch[
+                                                                       gpu_id],
+                                                                   tail_content_ids=corrupted_tail_content_id_batch[
+                                                                       gpu_id],
+                                                                   tail_content_len=corrupted_tail_content_len_batch[
+                                                                       gpu_id],
+                                                                   variable_scope=self.__model_scope)
 
-            triple_score = self.inference(triples=triple_batch,
-                                          head_content_ids=head_content_ids_batch,
-                                          head_content_len=head_content_len_batch,
-                                          tail_content_ids=tail_content_ids_batch,
-                                          tail_content_len=tail_content_len_batch,
-                                          variable_scope=self.__model_scope)
+                    relation_corrupted_triple_score = self.inference(triples=relation_corrupted_triple_batch[gpu_id],
+                                                                     head_content_ids=head_content_ids_batch[gpu_id],
+                                                                     head_content_len=head_content_len_batch[gpu_id],
+                                                                     tail_content_ids=tail_content_ids_batch[gpu_id],
+                                                                     tail_content_len=tail_content_len_batch[gpu_id],
+                                                                     variable_scope=self.__model_scope)
 
-            entity_corrupted_triple_score = self.inference(triples=entity_corrupted_triple_batch,
-                                                           head_content_ids=corrupted_head_content_id_batch,
-                                                           head_content_len=corrupted_head_content_len_batch,
-                                                           tail_content_ids=corrupted_tail_content_id_batch,
-                                                           tail_content_len=corrupted_tail_content_len_batch,
-                                                           variable_scope=self.__model_scope)
+                    loss = self.ranking_loss(triple_score,
+                                             entity_corrupted_triple_score) + self.ranking_loss(triple_score,
+                                                                                                relation_corrupted_triple_score)
 
-            relation_corrupted_triple_score = self.inference(triples=relation_corrupted_triple_batch,
-                                                             head_content_ids=head_content_ids_batch,
-                                                             head_content_len=head_content_len_batch,
-                                                             tail_content_ids=tail_content_ids_batch,
-                                                             tail_content_len=tail_content_len_batch,
-                                                             variable_scope=self.__model_scope)
+                    grads = optimizer.compute_gradients(loss)
+                    tower_grads.append(grads)
+                    losses.append(loss)
 
-            loss = self.ranking_loss(triple_score, entity_corrupted_triple_score) + self.ranking_loss(triple_score,
-                                                                                                      relation_corrupted_triple_score)
-            optimizer = tf.train.AdamOptimizer(self.lr)
-
-            grads = optimizer.compute_gradients(loss)
-            train_op = optimizer.apply_gradients(grads, global_step=self.global_step)
-
-            return train_op, loss
+            with tf.device('/cpu:0'):
+                grads = avg_grads(tower_grads)
+                train_op = optimizer.apply_gradients(grads, global_step=self.global_step)
+                loss_op = tf.reduce_mean(tf.stack(losses))
+            return train_op, loss_op
 
     def head_conv_helper(self, x):
         content_ids, content_len = multiple_content_lookup(self.content_matrix,
@@ -569,7 +586,7 @@ class DKRL(object):
             # [batch_size, 3]
             triples = tf.train.batch([input_triple_matrix],
                                      batch_size=batch_size,
-                                     capacity=batch_size * 100,
+                                     capacity=batch_size * 10,
                                      shapes=[[3]],
                                      enqueue_many=True,
                                      allow_smaller_final_batch=True,
@@ -827,13 +844,13 @@ def main(_):
     )
 
     config = tf.ConfigProto()
-    # config.graph_options.optimizer_options.global_jit_level = tf.OptimizerOptions.ON_1
+    config.graph_options.optimizer_options.global_jit_level = tf.OptimizerOptions.ON_1
     config.allow_soft_placement = True
     config.log_device_placement = False
     config.gpu_options.allow_growth = False
     config.gpu_options.per_process_gpu_memory_fraction = 0.95
 
-    train_op, loss_op = model.train_op(num_epochs=1, batch_size=1024)
+    train_op, loss_op = model.train_op(num_epochs=10, batch_size=1024)
     head_precompute_ops, head_conv_embed, tail_precompute_ops, tail_conv_embed, \
     eval_op, reset_op, metric_op = model.eval(eval_type='test', batch_size=200)
 
@@ -852,21 +869,23 @@ def main(_):
             coord = tf.train.Coordinator()
             threads = tf.train.start_queue_runners(sess=sess, coord=coord)
 
-            # try:
-            #     saver.restore(sess=sess, save_path=tf.train.latest_checkpoint('./checkpoint/'))
-            # except tf.errors.NotFoundError:
-            #     tf.logging.error("You may have changed your model and there "
-            #                      "are new variables that can not be load from previous snapshot. "
-            #                      "We will keep running but be aware that parts of your model are"
-            #                      " RANDOM MATRICES!")
+            try:
+                saver.restore(sess=sess, save_path=tf.train.latest_checkpoint('./checkpoint/'))
+            except tf.errors.NotFoundError:
+                tf.logging.error("You may have changed your model and there "
+                                 "are new variables that can not be load from previous snapshot. "
+                                 "We will keep running but be aware that parts of your model are"
+                                 " RANDOM MATRICES!")
 
             try:
-
+                cnt = 0
                 while not coord.should_stop():
-                    _, loss, global_step = sess.run([train_op, loss_op, model.global_step])
-                    print("corrupted heads : %d corrupted tails : %d" % (sess.run(model.head_corrupted),
-                                                                         sess.run(model.tail_corrupted)))
-                    print(global_step, loss)
+                    cnt += 1
+                    if cnt % 10 == 0:
+                        _, loss, global_step = sess.run([train_op, loss_op, model.global_step])
+                        print("GSTEP:_%d_LOSS:_%.4f" % (global_step, loss), end='\r')
+                    else:
+                        sess.run(train_op)
             except tf.errors.OutOfRangeError:
                 print("training done")
             finally:
@@ -898,19 +917,19 @@ def main(_):
                                  "We will keep running but be aware that parts of your model are"
                                  " RANDOM MARTICES!")
 
-            print("entity_embedding", sess.run(model.entity_embedding))
-            print("relation_embedding", sess.run(model.relation_embedding))
+            # print("entity_embedding", sess.run(model.entity_embedding))
+            # print("relation_embedding", sess.run(model.relation_embedding))
 
             try:
                 head_conv = list()
                 tail_conv = list()
 
-                print("head_conv_embed", sess.run(head_conv_embed))
-                print("tail_conv_embed", sess.run(tail_conv_embed))
+                # print("head_conv_embed", sess.run(head_conv_embed))
+                # print("tail_conv_embed", sess.run(tail_conv_embed))
 
                 for c, (head_precompute, tail_precompute) in enumerate(zip(head_precompute_ops, tail_precompute_ops)):
                     head, tail = sess.run([head_precompute, tail_precompute])
-                    print("precomputing CNN embeddings %d/%d" % (c, len(tail_precompute_ops)))
+                    print("precomputing CNN embeddings %d/%d" % (c, len(tail_precompute_ops)), end='\r')
                     head_conv.append(head)
                     tail_conv.append(tail)
                 head_conv_embed.load(np.concatenate(head_conv, axis=0), sess)
@@ -918,17 +937,17 @@ def main(_):
 
                 del head_conv, tail_conv
 
-                print(sess.run(head_conv_embed))
-                print(sess.run(tail_conv_embed))
+                # print(sess.run(head_conv_embed))
+                # print(sess.run(tail_conv_embed))
 
-                print(model.triple_matrix)
-                print(model.train_matrix)
-                print(model.valid_matrix)
-                print(model.test_matrix)
+                # print(model.triple_matrix)
+                # print(model.train_matrix)
+                # print(model.valid_matrix)
+                # print(model.test_matrix)
 
-                print("max ", sess.run(tf.reduce_max(model.triple_matrix[:, 0])))
-                print("max ", sess.run(tf.reduce_max(model.triple_matrix[:, 1])))
-                print("max ", sess.run(tf.reduce_max(model.triple_matrix[:, 2])))
+                # print("max ", sess.run(tf.reduce_max(model.triple_matrix[:, 0])))
+                # print("max ", sess.run(tf.reduce_max(model.triple_matrix[:, 1])))
+                # print("max ", sess.run(tf.reduce_max(model.triple_matrix[:, 2])))
                 cnt = 0
 
                 sess.run(reset_op)
