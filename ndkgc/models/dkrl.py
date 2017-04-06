@@ -5,6 +5,7 @@ import numpy as np
 import os
 import tensorflow as tf
 import tensorflow.contrib.layers as layers
+import tensorflow.contrib.training as training
 
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
 
@@ -408,35 +409,60 @@ class DKRL(object):
                                                   self.vocab_table,
                                                   single_triple[0],
                                                   name='h_content_lookup')
-                head_content_len = tf.shape(head_content_ids)[0]
+                head_content_len = tf.cast(tf.shape(head_content_ids)[0], tf.int32)
 
                 tail_content_ids = content_lookup(self.content_matrix,
                                                   self.vocab_table,
                                                   single_triple[2],
                                                   name='t_content_lookup')
-                tail_content_len = tf.shape(tail_content_ids)[0]
+                tail_content_len = tf.cast(tf.shape(tail_content_ids)[0], tf.int32)
 
                 corrupted_head_content_id = content_lookup(self.content_matrix,
                                                            self.vocab_table,
                                                            entity_corrupted_triple[0],
                                                            name='corrupted_h_content_lookup')
-                corrupted_head_content_len = tf.shape(corrupted_head_content_id)[0]
+                corrupted_head_content_len = tf.cast(tf.shape(corrupted_head_content_id)[0], tf.int32)
 
                 corrupted_tail_content_id = content_lookup(self.content_matrix,
                                                            self.vocab_table,
                                                            entity_corrupted_triple[2],
                                                            name='corrupted_t_content_lookup')
-                corrupted_tail_content_len = tf.shape(corrupted_tail_content_id)[0]
+                corrupted_tail_content_len = tf.cast(tf.shape(corrupted_tail_content_id)[0], tf.int32)
 
                 # Get content information for
-                #TODO: Change to tf.contrib.training.bucket_by_sequence_length
-                input_queue = tf.train.batch([single_triple,
-                                              entity_corrupted_triple,
-                                              relation_corrupted_triple,
-                                              head_content_ids, head_content_len,
-                                              tail_content_ids, tail_content_len,
-                                              corrupted_head_content_id, corrupted_head_content_len,
-                                              corrupted_tail_content_id, corrupted_tail_content_len],
+                single_instance_max_len = tf.maximum(head_content_len,
+                                                     tf.maximum(tail_content_len,
+                                                                tf.maximum(corrupted_head_content_len,
+                                                                           corrupted_tail_content_len)))
+
+                batch_input_tensors = [single_triple,
+                                       entity_corrupted_triple,
+                                       relation_corrupted_triple,
+                                       head_content_ids, head_content_len,
+                                       tail_content_ids, tail_content_len,
+                                       corrupted_head_content_id, corrupted_head_content_len,
+                                       corrupted_tail_content_id, corrupted_tail_content_len]
+
+                # TODO: Change to tf.contrib.training.bucket_by_sequence_length
+                # We need to put all *_content_ids into a matrix otherwise it will throw an error
+                # because it want to pack all elements together.
+                # _, input_queue = training.bucket_by_sequence_length(single_instance_max_len,
+                #                                                     [batch_input_tensors],
+                #                                                     batch_size=batch_size * 4,
+                #                                                     bucket_boundaries=[20, 40, 60, 80, 120],
+                #                                                     capacity=batch_size * 4 * 10,
+                #                                                     # shapes=[[3], [3], [3],
+                #                                                     #         [None], (),
+                #                                                     #         [None], (),
+                #                                                     #         [None], (),
+                #                                                     #         [None], ()],
+                #                                                     dynamic_pad=True,
+                #                                                     allow_smaller_final_batch=True,
+                #                                                     name="input_bucketed_queue")
+                #
+                # print("INPUT_QUEUE", input_queue)
+
+                input_queue = tf.train.batch(batch_input_tensors,
                                              batch_size=batch_size * 4,
                                              num_threads=4,
                                              capacity=min(batch_size * 40, self.train_matrix.get_shape()[0]),

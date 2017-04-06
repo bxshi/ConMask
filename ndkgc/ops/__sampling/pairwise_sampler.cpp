@@ -43,6 +43,50 @@ namespace {
     return Status::OK();
   }
 
+  Status MultipleNegativeSamplingShapeFn(InferenceContext *c) {
+    int32 num_sampled;
+    TF_RETURN_IF_ERROR(c->GetAttr("num_sampled", &num_sampled));
+    c->set_output(0, c->Vector(num_sampled));
+    return Status::OK();
+  }
+
+  class MultipleNegativeSamplingOp : public OpKernel {
+  private:
+    int _num_sampled;
+    int _max_range;
+  public:
+    explicit MultipleNegativeSamplingOp(OpKernelConstruction *context) : OpKernel(context) {
+        OP_REQUIRES_OK(context, context->GetAttr("num_sampled", &_num_sampled));
+        OP_REQUIRES_OK(context, context->GetAttr("max_range", &_max_range));
+    }
+    void Compute(OpKernelContext *context) override {
+        const Tensor &input_targets = context->input(0);
+        OP_REQUIRES(context, TensorShapeUtils::IsVector(input_targets.shape()),
+                    errors::InvalidArgument("targets must be a vector"));
+        gtl::ArraySlice<int32> targets(input_targets.vec<int32>().data(),
+                                       static_cast<size_t>(input_targets.dim_size(0)));
+        Tensor *output_false_targets = nullptr;
+        TensorShape output_shape;
+        output_shape.AddDim(_num_sampled);
+        OP_REQUIRES_OK(context, context->allocate_output(0, output_shape, &output_false_targets));
+
+        std::random_device rd;
+        std::mt19937 gen(rd());
+        std::uniform_int_distribution<int32> distribution(0, _max_range);
+
+        std::unordered_set<int32> avoids;
+        avoids.insert(targets.begin(), targets.end());
+        int num_sampled = 0;
+        while (num_sampled < _num_sampled) {
+          int sampled = distribution(gen);
+          if (gtl::InsertIfNotPresent(&avoids, sampled)) {
+            *(output_false_targets->vec<int32>().data() + num_sampled) = sampled;
+            ++num_sampled;
+          }
+        }
+    }
+  };
+
   class SingleNegativeSamplingOp : public OpKernel {
   private:
       int _max_range;
@@ -188,6 +232,17 @@ REGISTER_OP("SingleNegativeSampling")
     .SetShapeFn(SingleNegativeSamplingShapeFn)
     .Doc(R"doc(
 Sample one negative example in range[0, max_range] that does not overlaps with targets.
+)doc");
+
+REGISTER_KERNEL_BUILDER(Name("MultipleNegativeSampling").Device(DEVICE_CPU), MultipleNegativeSamplingOp);
+REGISTER_OP("MultipleNegativeSampling")
+    .Input("targets: int32")
+    .Attr("max_range: int")
+    .Attr("num_sampled: int")
+    .Output("false_target: int32")
+    .SetShapeFn(MultipleNegativeSamplingShapeFn)
+    .Doc(R"doc(
+Sample `num_sampled` negative example in range[0, max_range] that does not overlaps with targets.
 )doc");
 
 REGISTER_KERNEL_BUILDER(Name("PairwiseSampling").Device(DEVICE_CPU), PairwiseSamplingOp);

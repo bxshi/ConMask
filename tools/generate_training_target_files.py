@@ -34,7 +34,7 @@ with open(train_path, 'r', encoding='utf8') as f:
 print("")
 
 for value_file, idx_file, d in zip(['train.tails.values', 'train.heads.values'],
-                                   ['train.heads.idx', 'train.heads.idx'],
+                                   ['train.tails.idx', 'train.heads.idx'],
                                    [target_tail_dict, target_head_dict]):
     with open(os.path.join(sys.argv[1], value_file), 'w', encoding='utf8') as f_tail:
         with open(os.path.join(sys.argv[1], idx_file), 'w', encoding='utf8') as f_idx:
