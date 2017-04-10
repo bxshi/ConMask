@@ -113,6 +113,7 @@ def load_vocab_embedding(embedding_path, vocab_dict, oov):
 
     return word_embedding
 
+
 def load_manual_evaluation_file_by_rel(file_path, avoid_file_path):
     """
     Load normal head, tail, rel files, divide them into dicts
@@ -137,7 +138,7 @@ def load_manual_evaluation_file_by_rel(file_path, avoid_file_path):
         for line in f:
             avoid_entities.add(line.strip())
 
-    eval_triple_dict = dict() # rel : {head : [tail]}
+    eval_triple_dict = dict()  # rel : {head : [tail]}
     with open(file_path, 'r', encoding='utf8') as f:
         for line in f:
             head, tail, rel = line.strip().split('\t')
@@ -150,6 +151,7 @@ def load_manual_evaluation_file_by_rel(file_path, avoid_file_path):
             else:
                 eval_triple_dict[rel][head].add(tail)
     return eval_triple_dict
+
 
 def load_manual_evaluation_file(file_path, avoid_file_path):
     """
@@ -203,8 +205,9 @@ def load_relation_specific_targets(tail_rel_path, rel_path):
             rels[rel].add(tail)
     return rels
 
+
 def load_filtered_targets(idx_file, value_file):
-    filtered_targets = dict() # ent\t rel -> list of targets
+    filtered_targets = dict()  # ent\t rel -> list of targets
     with open(idx_file, 'r', encoding='utf8') as f_idx:
         with open(value_file, 'r', encoding='utf8') as f_val:
             for idx, val in zip(f_idx, f_val):

@@ -263,8 +263,9 @@ def main(_):
                                                        devices=['/gpu:0', '/gpu:1', '/gpu:2'])
     else:
         tf.logging.info("Evaluate mode")
-        ph_head_rel, ph_eval_targets, ph_true_target_idx, \
-        ph_test_target_idx, eval_op, ranks, rr, rand_ranks, rand_rr = model.manual_eval_ops('/gpu:3')
+        ph_head_rel, ph_eval_targets, ph_target_size, q_size, ph_true_target_idx, \
+        ph_test_target_idx, pre_compute_tails, re_enqueue, dequeue_op, ranks, rr, rand_ranks, rand_rr = model.manual_eval_ops_v2(
+            '/gpu:3')
 
     EVAL_BATCH = 500
     # ph_eval_triples, triple_enqueue_op, batch_data_op, batch_pred_score_op, metric_update_ops = model.auto_eval_ops(
@@ -357,16 +358,12 @@ def main(_):
                         # print("evaluation done")
                         # sess.run(model.is_train.assign(True))
                 else:
-
-                    # Set mode to evaluation
-                    sess.run(model.is_train.assign(True))
-                    print(sess.run(model.is_train))
-                    # ph_head_rel, ph_eval_targets, ph_true_target_idx, ph_test_target_idx, ranks, rr
-
                     # First load evaluation data
-                    evaluation_data = load_manual_evaluation_file(os.path.join(dataset_dir, 'test.txt'),
-                                                                  os.path.join(dataset_dir, 'avoid_entities.txt'))
-
+                    # {rel : {head : [tails]}}
+                    evaluation_data = load_manual_evaluation_file_by_rel(os.path.join(dataset_dir, 'test.txt'),
+                                                                         os.path.join(dataset_dir,
+                                                                                      'avoid_entities.txt'))
+                    tf.logging.info("Number of relationships in the evaluation file %d" % len(evaluation_data))
                     relation_specific_targets = load_relation_specific_targets(
                         os.path.join(dataset_dir, 'train.heads.idx'),
                         os.path.join(dataset_dir, 'relations.txt'))
@@ -383,92 +380,86 @@ def main(_):
 
                     # Randomly assign some values to the targets, and then run the evaluation
 
+                    # New evaluation method - evaluate by relationship
                     missed = 0
-                    for c, (head_rel_str, eval_true_targets_set) in enumerate(evaluation_data.items()):
-                        head_str, rel_str = head_rel_str.split('\t')
-                        # [1, 2]
-                        head_rel = [[head_str, rel_str]]
+                    for c, rel_str in enumerate(evaluation_data.keys()):
 
                         if rel_str not in relation_specific_targets:
                             tf.logging.warning("Relation %s does not have any valid targets!" % rel_str)
-                        elif len(eval_true_targets_set) == 0:
-                            tf.logging.warning("%s->%s->? has 0 targets" % (head_str, rel_str))
-                        else:
-                            # targets we will evaluate in this batch, all other targets will be
-                            # ignored and consider as irrelevant
-                            eval_targets_set = relation_specific_targets[rel_str]
+                            continue
+                        # First pre-compute the target embeddings
+                        eval_targets_set = relation_specific_targets[rel_str]
+                        eval_targets = list(eval_targets_set)
 
-                            # TODO: Performance: If eval_targets_set is too large, break it into small batches instead
+                        tf.logging.debug("\nRelation %s : %d" % (rel_str, len(eval_targets)))
+                        start = 0
+                        while start < len(eval_targets):
+                            end = min(start + EVAL_BATCH, len(eval_targets))
+                            sess.run(pre_compute_tails, feed_dict={ph_eval_targets: [eval_targets[start:end]]})
+                            start = end
 
-                            # Find true targets (in train/valid/test) of the given head relation in the evaluation set and skip all others
+                        assert sess.run(q_size) == len(eval_targets)
+
+                        for head_str, eval_true_targets_set in evaluation_data[rel_str].items():
+                            head_rel = [[head_str, rel_str]]
+                            head_rel_str = "\t".join([head_str, rel_str])
+
+                            # Find true targets (in train/valid/test) of the given head relation
+                            # in the evaluation set and skip all others
                             true_targets = set(filtered_targets[head_rel_str]).intersection(eval_targets_set)
-                            # for v in true_targets:
-                            #     assert v in eval_targets_set
 
                             # find true evaluation targets in the test set that are in this set
                             eval_true_targets = set.intersection(eval_targets_set, eval_true_targets_set)
-                            # for v in eval_true_targets:
-                            #     assert v in eval_targets_set
 
                             # how many true targets we missed/filtered out
                             missed += len(eval_true_targets_set) - len(eval_true_targets)
 
-                            if len(eval_true_targets) == 0:
-                                tf.logging.debug("find %s/%s true evaluation targets in the evaluation set" % (
-                                    len(eval_true_targets),
-                                    len(eval_true_targets_set)))
-                            else:
-                                eval_targets = list(eval_targets_set)
+                            test_target_idx = sorted([eval_targets.index(x) for x in eval_true_targets])
+                            true_target_idx = sorted([eval_targets.index(x) for x in true_targets])
 
-                                test_target_idx = sorted([eval_targets.index(x) for x in eval_true_targets])
-                                true_target_idx = sorted([eval_targets.index(x) for x in true_targets])
+                            assert len(true_target_idx) >= len(test_target_idx)
 
-                                # filter target set always is a superset of evaluation target set
-                                assert len(true_target_idx) >= len(test_target_idx)
+                            _ranks, _rr, _rand_ranks, _rand_rr, _ = sess.run(
+                                [ranks, rr, rand_ranks, rand_rr, re_enqueue],
+                                feed_dict={ph_head_rel: head_rel,
+                                           ph_target_size: len(eval_targets_set),
+                                           ph_true_target_idx: true_target_idx,
+                                           ph_test_target_idx: test_target_idx})
 
-                                # print("head rel", head_rel_str)
-                                # print("true_targets: ", [eval_targets[x] for x in true_target_idx])
-                                # print("eval_true_targets: ", [eval_targets[x] for x in test_target_idx])
-                                # print("eval_targets:", eval_targets)
+                            assert sess.run(q_size) == len(eval_targets)
 
-                                # First calculate the scores and put then into a queue for future analysis
-                                start = 0
-                                while start < len(eval_targets):
-                                    end = min(start + EVAL_BATCH, len(eval_targets))
-                                    sess.run(eval_op, feed_dict={ph_head_rel: head_rel,
-                                                                 ph_eval_targets: [eval_targets[start:end]]})
-                                    start = end
+                            all_ranks.extend([float(x) for x in _ranks])
+                            all_rr.append(_rr)
+                            all_multi_rr.extend([1.0 / float(x) for x in _ranks])
 
-                                eval_dict = {ph_head_rel: head_rel,
-                                             ph_true_target_idx: true_target_idx,
-                                             ph_test_target_idx: test_target_idx}
-                                _rand_ranks, _rand_rr = sess.run([rand_ranks, rand_rr], feed_dict=eval_dict)
+                            random_ranks.extend([float(x) for x in _rand_ranks])
+                            random_rr.append(_rand_rr)
+                            random_multi_rr.extend([1.0 / float(x) for x in _rand_ranks])
 
-                                _ranks, _rr = sess.run([ranks, rr], feed_dict=eval_dict)
-                                # print(len(eval_true_targets), " target ranks", _ranks)
-                                # print("scores", _scores)
-                                # print("masked scores", _masked_scores.shape)
-                                # print("pred scores", _pred_scores.shape)
-                                all_ranks.extend([float(x) for x in _ranks])
-                                all_rr.append(_rr)
-                                all_multi_rr.extend([1.0 / float(x) for x in _ranks])
+                            print("%d/%d %d "
+                                  "MR %.4f (%.4f) "
+                                  "MRR(per head,rel) %.4f (%.4f) "
+                                  "MRR(per tail) %.4f (%.4f) missed %d" % (
+                                      c, len(evaluation_data), len(all_ranks),
+                                      np.mean(all_ranks), np.mean(random_ranks),
+                                      np.mean(all_rr), np.mean(random_rr),
+                                      np.mean(all_multi_rr), np.mean(random_multi_rr),
+                                      missed), end='\r')
+                            # clean up precomputed targets
+                        sess.run(dequeue_op, feed_dict={ph_target_size: len(eval_targets_set)})
+                        assert sess.run(q_size) == 0
+                    print("\n%d "
+                          "MR %.4f (%.4f) "
+                          "MRR(per head,rel) %.4f (%.4f) "
+                          "MRR(per tail) %.4f (%.4f) missed %d" % (
+                              len(all_ranks),
+                              np.mean(all_ranks), np.mean(random_ranks),
+                              np.mean(all_rr), np.mean(random_rr),
+                              np.mean(all_multi_rr), np.mean(random_multi_rr),
+                              missed))
 
-                                random_ranks.extend([float(x) for x in _rand_ranks])
-                                random_rr.append(_rand_rr)
-                                random_multi_rr.extend([1.0 / float(x) for x in _rand_ranks])
-
-                                print("%d/%d %d "
-                                      "MR %.4f (%.4f) "
-                                      "MRR(per head,rel) %.4f (%.4f) "
-                                      "MRR(per tail) %.4f (%.4f) missed %d" % (
-                                          c, len(evaluation_data), len(all_ranks),
-                                          np.mean(all_ranks), np.mean(random_ranks),
-                                          np.mean(all_rr), np.mean(random_rr),
-                                          np.mean(all_multi_rr), np.mean(random_multi_rr),
-                                          missed), end='\r')
-                                # exit(0)
-                    print("")
                     exit(0)
+
 
         except tf.errors.OutOfRangeError:
             print("training done")
