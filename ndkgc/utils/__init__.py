@@ -113,6 +113,43 @@ def load_vocab_embedding(embedding_path, vocab_dict, oov):
 
     return word_embedding
 
+def load_manual_evaluation_file_by_rel(file_path, avoid_file_path):
+    """
+    Load normal head, tail, rel files, divide them into dicts
+    {
+        relation : {
+            head : [tails]
+        }
+    }
+    We also skip all tail entities that does not exist
+    in the training file using the avoid file.
+
+    The head are open entities only which are the entities
+    that are not in the KG during training
+
+    :param file_path:
+    :param avoid_file_path:
+    :return:
+    """
+
+    avoid_entities = set()
+    with open(avoid_file_path, 'r', encoding='utf8') as f:
+        for line in f:
+            avoid_entities.add(line.strip())
+
+    eval_triple_dict = dict() # rel : {head : [tail]}
+    with open(file_path, 'r', encoding='utf8') as f:
+        for line in f:
+            head, tail, rel = line.strip().split('\t')
+            if tail in avoid_entities or head not in avoid_entities:
+                continue
+            if rel not in eval_triple_dict:
+                eval_triple_dict[rel] = dict()
+            if head not in eval_triple_dict[rel]:
+                eval_triple_dict[rel][head] = {tail}
+            else:
+                eval_triple_dict[rel][head].add(tail)
+    return eval_triple_dict
 
 def load_manual_evaluation_file(file_path, avoid_file_path):
     """

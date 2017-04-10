@@ -1,7 +1,6 @@
 from intbitset import intbitset
-import math
+
 import tensorflow.contrib.layers as layers
-import tensorflow.contrib.metrics as metrics
 
 from ndkgc.ops import *
 from ndkgc.utils import *
@@ -58,7 +57,6 @@ class ContentModel(object):
 
         self.NON_TRAINABLE = 'non_trainable'
 
-        self.num_epoch = kwargs['num_epoch']
         self.word_oov = kwargs['word_oov']
         self.word_embedding_size = kwargs['word_embedding_size']
 
@@ -1125,6 +1123,120 @@ class ContentModel(object):
                                                   name='ent_set_indicator')
             return indicator
 
+    def manual_eval_ops_v2(self, device='/cpu:0'):
+        """ Manually evaluate one single partial triple with a given set of targets
+
+        This function will reduce the computation by reusing the targets of the same
+        relationships.
+
+        To use this method, first calculate the transformed tails of all the targets
+        and put them into a pipeline, then for each head, rel pair we fetch these precomputed
+        target representations and do the calculation to get the similarity score.
+
+        After we evaluated one type of relationship, one needs to manually clean up
+        the queue so it can be reused by next relationship.
+
+        :param device:
+        :return:
+        """
+
+        with tf.name_scope("manual_evaluation_v2"):
+            with tf.device(device):
+                # the input head, rel pair to evaluate
+                ph_head_rel = tf.placeholder(tf.string, [1, 2], name='ph_head_rel')
+                # tail targets to evaluate, this can be just part of the total targets
+                ph_eval_targets = tf.placeholder(tf.string, [1, None], name='ph_eval_targets')
+                # indices of true tail targets in the overall target list
+                ph_true_target_idx = tf.placeholder(tf.int32, [None], name='ph_true_target_idx')
+                # indices of true targets in the evaluation set
+                ph_test_target_idx = tf.placeholder(tf.int32, [None], name='ph_test_target_idx')
+
+                ph_target_size = tf.placeholder(tf.int32, (), name='ph_target_size')
+
+                # A temporary queue for precomputed tails
+                pre_computed_tail_queue = tf.FIFOQueue(1000000, dtypes=tf.float32,
+                                                       shapes=[[self.word_embedding_size]],
+                                                       # This may needs to be change later
+                                                       name='tail_queue')
+
+                # Convert string targets to numerical ids
+                eval_tails = self.entity_table.lookup(ph_eval_targets)
+                # computed tails [1, ?, word_dim]
+                computed_tails = tf.squeeze(self.__transform_tail_entity(eval_tails, reuse=True, device=device), axis=0)
+
+                # put pre-computed tails into target queue
+                # Call this to pre-compute tails for a certain relationship
+                pre_compute_tails = pre_computed_tail_queue.enqueue_many(computed_tails)
+
+                # get pre-computed tails from target queue
+                dequeue_op = pre_computed_tail_queue.dequeue_many(ph_target_size)
+                tail_embeds = tf.expand_dims(dequeue_op, axis=0)
+                tf.logging.info("tail_embeds shape %s" % tail_embeds.get_shape())
+                # Put tails back into the queue (this will run after tails are dequeued)
+                with tf.control_dependencies([dequeue_op]):
+                    re_enqueue = pre_computed_tail_queue.enqueue_many(dequeue_op)
+
+                # First, convert string to indices
+                str_heads, str_rels = tf.unstack(ph_head_rel, axis=1)
+                heads = self.entity_table.lookup(str_heads)
+                rels = self.relation_table.lookup(str_rels)
+
+                # Calculate heads and tails
+                computed_heads = self.__transform_head_entity(heads, reuse=True, device=device)
+                computed_rels = self.__transform_relation(rels, reuse=True, device=device)
+                combined_head_rel = self.__combine_head_relation(transformed_heads=computed_heads,
+                                                                 transformed_rels=computed_rels,
+                                                                 reuse=True,
+                                                                 device=device)
+
+                # This is the score of all the targets given a single partial triple
+                pred_scores = tf.reshape(self.__predict(combined_head_rel,
+                                                        tail_embeds,
+                                                        reuse=True,
+                                                        device=device), [-1, 1])
+
+                tf.logging.info("eval pred_scores %s" % pred_scores.get_shape())
+
+                ranks, rr = self.eval_helper(pred_scores, ph_test_target_idx, ph_true_target_idx)
+
+                rand_ranks, rand_rr = self.eval_helper(
+                    tf.random_uniform(tf.shape(pred_scores), minval=-1, maxval=1, dtype=tf.float32),
+                    ph_test_target_idx, ph_true_target_idx)
+
+                return ph_head_rel, ph_eval_targets, ph_target_size, pre_computed_tail_queue.size(), \
+                       ph_true_target_idx, ph_test_target_idx, \
+                       pre_compute_tails, re_enqueue, dequeue_op, ranks, rr, rand_ranks, rand_rr
+
+    @staticmethod
+    def eval_helper(scores, test_target_idx, true_target_idx):
+        # [?, 1] scores of each true target in evaluation set
+        eval_target_scores = tf.nn.embedding_lookup(scores, test_target_idx)
+
+        tf.logging.info("eval_target_scores %s" % eval_target_scores)
+
+        # [?, 2] idx are [idx, 0]
+        true_target_mask_idx = tf.transpose(tf.stack([tf.cast(true_target_idx, tf.int64),
+                                                      tf.zeros_like(true_target_idx, dtype=tf.int64)],
+                                                     axis=0))
+
+        # [?, 1]
+        true_target_mask = tf.SparseTensor(indices=true_target_mask_idx,
+                                           values=tf.ones_like(true_target_idx, dtype=tf.float32) * (
+                                               -1e10),
+                                           dense_shape=tf.shape(scores, out_type=tf.int64))
+
+        tf.logging.info("true_target_mask %s" % true_target_mask)
+
+        # apply true_target_mask on to pred_scores, [None, 1]
+        masked_scores = scores + tf.sparse_tensor_to_dense(true_target_mask)
+
+        # extracted ranks for each evaluation target [1, None] > [None, 1] => [None, None] => [None]
+        ranks = tf.reduce_sum(
+            tf.cast(tf.greater(tf.transpose(masked_scores), eval_target_scores), tf.int32), axis=-1) + 1
+        rr = 1.0 / tf.cast(tf.reduce_min(ranks), tf.float32)
+
+        return ranks, rr
+
     def manual_eval_ops(self, device='/cpu:0'):
         """ Manually evaluate one single partial triple with a given set of targets
 
@@ -1166,441 +1278,50 @@ class ContentModel(object):
                                                                tails=eval_tails,
                                                                device=device), [-1, 1])
 
-                tf.logging.info("pred_scores %s" % pred_scores.get_shape())
+                pred_scores_queue = tf.FIFOQueue(1000000, dtypes=tf.float32, shapes=[[1]], name='pred_scores_queue')
 
-                # [?, 1] scores of each true target in evaluation set
-                eval_target_scores = tf.nn.embedding_lookup(pred_scores, ph_test_target_idx)
+                enqueue_op = pred_scores_queue.enqueue_many(pred_scores)
 
-                tf.logging.info("eval_target_scores %s" % eval_target_scores)
+                dequeue_op = pred_scores_queue.dequeue_many(pred_scores_queue.size())
 
-                # [?, 2] idx are [idx, 0]
-                true_target_mask_idx = tf.transpose(tf.stack([tf.cast(ph_true_target_idx, tf.int64),
-                                                              tf.zeros_like(ph_true_target_idx, dtype=tf.int64)], axis=0))
+                tf.logging.info("pred_scores %s" % dequeue_op.get_shape())
 
-                # [?, 1]
-                true_target_mask = tf.SparseTensor(indices=true_target_mask_idx,
-                                                   values=tf.ones_like(ph_true_target_idx, dtype=tf.float32) * (-1e10),
-                                                   dense_shape=tf.shape(pred_scores, out_type=tf.int64))
+                def eval_helper(scores):
+                    # [?, 1] scores of each true target in evaluation set
+                    eval_target_scores = tf.nn.embedding_lookup(scores, ph_test_target_idx)
 
-                tf.logging.info("true_target_mask %s" % true_target_mask)
+                    tf.logging.info("eval_target_scores %s" % eval_target_scores)
 
-                # apply true_target_mask on to pred_scores, [None, 1]
-                masked_scores = pred_scores + tf.sparse_tensor_to_dense(true_target_mask)
+                    # [?, 2] idx are [idx, 0]
+                    true_target_mask_idx = tf.transpose(tf.stack([tf.cast(ph_true_target_idx, tf.int64),
+                                                                  tf.zeros_like(ph_true_target_idx, dtype=tf.int64)],
+                                                                 axis=0))
 
-                # extracted ranks for each evaluation target [1, None] > [None, 1] => [None, None] => [None]
-                ranks = tf.reduce_sum(tf.cast(tf.greater(tf.transpose(masked_scores), eval_target_scores), tf.int32), axis=-1) + 1
-                rr = 1.0 / tf.cast(tf.reduce_min(ranks), tf.float32)
+                    # [?, 1]
+                    true_target_mask = tf.SparseTensor(indices=true_target_mask_idx,
+                                                       values=tf.ones_like(ph_true_target_idx, dtype=tf.float32) * (
+                                                           -1e10),
+                                                       dense_shape=tf.shape(scores, out_type=tf.int64))
 
-                ph_ent_rel_str = tf.placeholder(tf.string, [1], name='ph_ent_rel_str')
-                true_tails = get_true_tails(ph_ent_rel_str,
-                                            self.evaluation_target_tails_table,
-                                            self.evaluation_closed_target_tails)
+                    tf.logging.info("true_target_mask %s" % true_target_mask)
 
-                return ph_head_rel, ph_eval_targets, ph_true_target_idx, ph_test_target_idx, ph_ent_rel_str, true_tails, ranks, rr, eval_target_scores, pred_scores, masked_scores
+                    # apply true_target_mask on to pred_scores, [None, 1]
+                    masked_scores = scores + tf.sparse_tensor_to_dense(true_target_mask)
 
-    def auto_eval_ops(self, batch_size, n_splits=50, device='/cpu:0'):
-        """ Automatically evaluation on the evaluation matrix
-        """
-        with tf.name_scope("auto_evaluation"):
-            with tf.device('/cpu:0'):
-                bsize = tf.constant(batch_size, tf.int32, shape=(), name='batch_size')
-                ph_evaluation_triples = tf.placeholder(tf.string, [None, 3], name='ph_triples')
-                triple_queue = tf.FIFOQueue(81920, [tf.string], [[3]])
-                enqueue_triple = triple_queue.enqueue_many(ph_evaluation_triples)
+                    # extracted ranks for each evaluation target [1, None] > [None, 1] => [None, None] => [None]
+                    ranks = tf.reduce_sum(
+                        tf.cast(tf.greater(tf.transpose(masked_scores), eval_target_scores), tf.int32), axis=-1) + 1
+                    rr = 1.0 / tf.cast(tf.reduce_min(ranks), tf.float32)
 
-                # This makes sure the dequeue will not be blocked due to insufficient elements
-                current_bsize = tf.maximum(1, tf.minimum(bsize, triple_queue.size()), name='current_batch_size')
-                # Make sure you checked your number of calls
-                # otherwise this will block the entire system because we do not
-                # have enough data in the pipeline
-                str_triple_batch = triple_queue.dequeue_up_to(current_bsize)
+                    return ranks, rr
 
-                # single head, rel tail
-                str_heads, str_rels, str_tails = tf.unstack(str_triple_batch, axis=1)
-                tf.logging.info("[%s] str_heads %s "
-                                "str_rels %s "
-                                "str_tails %s" % (sys._getframe().f_code.co_name,
-                                                  str_heads.get_shape(),
-                                                  str_rels.get_shape(),
-                                                  str_tails.get_shape()))
+                ranks, rr = eval_helper(dequeue_op)
 
-                # single head, tail, rel in numerical format
-                # Reshape them so they are [b_size, 1]
-                heads, rels, tails = [tf.expand_dims(x, axis=1) for x in triple_id_lookup(str_heads,
-                                                                                          str_rels,
-                                                                                          str_tails,
-                                                                                          self.entity_table,
-                                                                                          self.relation_table)]
+                rand_ranks, rand_rr = eval_helper(tf.random_uniform(tf.stack([pred_scores_queue.size(), 1], axis=0),
+                                                                    minval=-1, maxval=1, dtype=tf.float32))
 
-                # Calculate a boolean vector for head and tails,
-                # True if the entity is presented in the training data
-
-                tf.logging.info("[%s] heads %s "
-                                "rels %s "
-                                "tails %s" % (sys._getframe().f_code.co_name,
-                                              heads.get_shape(),
-                                              rels.get_shape(),
-                                              tails.get_shape()))
-
-                # For the given batch, calculate the score of it
-                with tf.device(device):
-                    pred_scores = self.translate_triple(heads, tails, rels, device=device)
-                tf.logging.info("[%s] pred_scores shape %s " % (sys._getframe().f_code.co_name,
-                                                                pred_scores.get_shape()))
-
-                # Now calculate the score of the modifiers so we can get the "filtered" scores
-
-                #
-
-                # Scores of the modifiers
-                closed_tails, closed_tails_mask = get_true_targets(entity=str_heads, relation=str_rels,
-                                                                   targets_lookup_table=self.evaluation_target_tails_table,
-                                                                   entity_table=self.entity_table,
-                                                                   targets=self.evaluation_closed_target_tails)
-
-                closed_heads, closed_heads_mask = get_true_targets(entity=str_tails, relation=str_rels,
-                                                                   targets_lookup_table=self.evaluation_target_heads_table,
-                                                                   entity_table=self.entity_table,
-                                                                   targets=self.evaluation_closed_target_heads)
-
-                open_tails, open_tails_mask = get_true_targets(entity=str_heads, relation=str_rels,
-                                                               targets_lookup_table=self.evaluation_target_tails_table,
-                                                               entity_table=self.entity_table,
-                                                               targets=self.evaluation_open_target_tails)
-
-                open_heads, open_heads_mask = get_true_targets(entity=str_tails, relation=str_rels,
-                                                               targets_lookup_table=self.evaluation_target_heads_table,
-                                                               entity_table=self.entity_table,
-                                                               targets=self.evaluation_open_target_heads)
-
-                # TODO: Performance: concatenate these together to speed up
-                # TODO: Performance: split these into batches using map_fn to reduce the memory usage
-                pred_true_open_heads = self._eval_padded_targets(heads=open_heads,
-                                                                 rels=rels,
-                                                                 tails=tails,
-                                                                 masks=open_heads_mask,
-                                                                 device=device)
-                pred_true_open_tails = self._eval_padded_targets(heads=heads,
-                                                                 rels=rels,
-                                                                 tails=open_tails,
-                                                                 masks=open_tails_mask,
-                                                                 device=device)
-                pred_true_closed_heads = self._eval_padded_targets(heads=closed_heads,
-                                                                   rels=rels,
-                                                                   tails=tails,
-                                                                   masks=closed_heads_mask,
-                                                                   device=device)
-                pred_true_closed_tails = self._eval_padded_targets(heads=heads,
-                                                                   rels=rels,
-                                                                   tails=closed_tails,
-                                                                   masks=closed_tails_mask,
-                                                                   device=device)
-
-                # Calculate the rank on the open and closed targets
-                def __create_split_target_matrix(entities, n_splits):
-                    if n_splits <= 1:
-                        return tf.expand_dims(entities, axis=0), tf.shape(entities)[:1]
-
-                    # split size of each partition besides the last one
-                    target_split_size = tf.floor_div(tf.shape(entities)[0], n_splits, name='split_size')
-
-                    split_len = tf.tile(tf.expand_dims(target_split_size, axis=0), [n_splits - 1])
-                    last_split_len = tf.shape(entities)[:1] - (n_splits - 1) * target_split_size
-
-                    tf.logging.info("split_len %s" % split_len.get_shape())
-                    tf.logging.info("last_split_len %s" % last_split_len.get_shape())
-
-                    target_split_len = tf.concat([split_len, last_split_len], axis=0)
-
-                    tf.logging.info(
-                        "target_split_size %s %s" % (target_split_size.get_shape(), target_split_size.dtype))
-
-                    max_split_len = tf.reduce_max(target_split_len)
-
-                    tf.logging.info("[%s] entities %s"
-                                    "target_split_size %s "
-                                    "target_split_len %s "
-                                    "max_split_len %s" % (sys._getframe().f_code.co_name,
-                                                          entities.get_shape(),
-                                                          target_split_size.get_shape(),
-                                                          target_split_len.get_shape(),
-                                                          max_split_len.get_shape()))
-
-                    entity_splits = tf.split(entities, target_split_len, axis=0)
-                    entity_split_lens = tf.unstack(target_split_len, n_splits, axis=0)
-
-                    tf.logging.info("[%s] entity_splits %s"
-                                    "entity_split_lens %s " % (sys._getframe().f_code.co_name,
-                                                               entity_splits[0].get_shape(),
-                                                               entity_split_lens[0].get_shape()))
-
-                    # Pad targets with -1
-                    padded_entities = tf.pad(entities - 1,
-                                             paddings=[[0, max_split_len * n_splits - tf.shape(entities)[0]]]) + 1
-                    target_batches = tf.reshape(padded_entities, [n_splits, max_split_len])
-
-                    tf.logging.info("[%s] target_batches %s" % (sys._getframe().f_code.co_name,
-                                                                target_batches.get_shape()))
-
-                    return target_batches, target_split_len
-
-                # These two are shared among head and tail prediction
-
-                split_open_targets, open_targets_len = __create_split_target_matrix(self.avoid_entities, n_splits)
-                split_closed_targets, closed_targets_len = __create_split_target_matrix(self.closed_entities,
-                                                                                        n_splits * 10)
-
-                tf.logging.info("split_open_targets %s %s" % (split_open_targets, open_targets_len))
-                tf.logging.info("split_closed_targets %s %s" % (split_closed_targets, closed_targets_len))
-
-                def __evaluate_target_helper(x):
-                    # The targets are padded targets,
-                    # so we only want the true targets without the padding
-                    targets, target_len = x
-
-                    head_scores, tail_scores = self._eval_targets(heads=heads,
-                                                                  rels=rels,
-                                                                  tails=tails,
-                                                                  targets=targets,
-                                                                  device=device)
-
-                    head_scores = tf.slice(head_scores, [0, 0], [-1, target_len])
-                    tail_scores = tf.slice(tail_scores, [0, 0], [-1, target_len])
-
-                    head_rank, head_eq = self._calculate_rank(head_scores, pred_scores)
-                    tail_rank, tail_eq = self._calculate_rank(tail_scores, pred_scores)
-
-                    return tf.stack([tf.reshape(x, [-1]) for x in [head_rank, head_eq, tail_rank, tail_eq]])
-
-                # [n_splits, 4, batch_size]
-                with tf.device(device):
-
-                    open_ranks = tf.map_fn(__evaluate_target_helper,
-                                           [split_open_targets, open_targets_len],
-                                           dtype=tf.int32,
-                                           parallel_iterations=1,
-                                           back_prop=False,
-                                           swap_memory=True,
-                                           name='open_ranks')
-
-                    # [n_splits, 4, batch_size]
-                    closed_ranks = tf.map_fn(__evaluate_target_helper,
-                                             [split_closed_targets, closed_targets_len],
-                                             dtype=tf.int32,
-                                             parallel_iterations=1,
-                                             back_prop=False,
-                                             swap_memory=True,
-                                             name='closed_ranks')
-
-                tf.logging.info("[%s] split_open_targets %s "
-                                "open_ranks %s "
-                                "split_closed_targets %s"
-                                "closed_ranks %s " % (sys._getframe().f_code.co_name,
-                                                      split_open_targets.get_shape(),
-                                                      open_ranks.get_shape(),
-                                                      split_closed_targets.get_shape(),
-                                                      closed_ranks.get_shape()))
-
-                # [batch_size, 4]
-                all_open_heads_rank, all_open_heads_eq, all_open_tails_rank, all_open_tails_eq = tf.unstack(
-                    tf.reduce_sum(open_ranks, axis=0), axis=0)
-                all_closed_heads_rank, all_closed_heads_eq, all_closed_tails_rank, all_closed_tails_eq = tf.unstack(
-                    tf.reduce_sum(closed_ranks, axis=0), axis=0)
-
-                closed_tails_rank, closed_tails_eq = self._calculate_rank(pred_true_closed_tails, pred_scores)
-                closed_heads_rank, cloesd_heads_eq = self._calculate_rank(pred_true_closed_heads, pred_scores)
-                open_tails_rank, open_tails_eq = self._calculate_rank(pred_true_open_tails, pred_scores)
-                open_heads_rank, open_tails_eq = self._calculate_rank(pred_true_open_heads, pred_scores)
-
-                classic_head_rank = all_closed_heads_rank + 1
-                classic_filtered_head_rank = classic_head_rank - closed_heads_rank
-                classic_tail_rank = all_closed_tails_rank + 1
-                classic_filtered_tail_rank = classic_tail_rank - closed_tails_rank
-
-                new_head_rank = all_closed_heads_rank + all_open_heads_rank + 1
-                new_filtered_head_rank = new_head_rank - closed_heads_rank - open_heads_rank
-                new_tail_rank = all_closed_tails_rank + all_open_tails_rank + 1
-                new_filtered_tail_rank = new_tail_rank - closed_tails_rank - open_tails_rank
-
-                # Here we have the scores for this mini batch, then we need to distribute the scores to the accumulators according to their types
-                # we use avoid_entities instead of the closed_entities because this should be significantly smaller
-                head_in_train = tf.logical_not(self.entity_in_set_indicator(heads, self.avoid_entities))
-                tail_in_train = tf.logical_not(self.entity_in_set_indicator(tails, self.avoid_entities))
-
-                # Closed world
-                # Two types, seen head -> seen tail AND seen tail -> seen head
-                # This is the typical setting of the closed world KGC
-                # seen head -> seen tail
-                both_in_train_mask = tf.logical_and(head_in_train, tail_in_train, name='both_in_train_mask')
-                closed_head_pred_tail = tf.boolean_mask(classic_tail_rank, both_in_train_mask)
-                closed_filtered_head_pred_tail = tf.boolean_mask(classic_filtered_tail_rank, both_in_train_mask)
-                closed_tail_pred_head = tf.boolean_mask(classic_head_rank, both_in_train_mask)
-                closed_filtered_tail_pred_head = tf.boolean_mask(classic_filtered_head_rank, both_in_train_mask)
-
-                # Open world
-                # When predicting on unseen elements,
-                #   the target entity candidates should be all entities including the unseen ones
-                # When predicting on seen elements,
-                #   the target entity candidates should be just closed entities
-                both_not_in_train_mask = tf.logical_and(tf.logical_not(head_in_train),
-                                                        tf.logical_not(tail_in_train))
-
-                # unseen head -> unseen tail (target should be all entities in both open and closed world)
-                open_unseen_head_to_unseen_tail = tf.boolean_mask(new_tail_rank, both_not_in_train_mask)
-                open_filtered_unseen_head_to_unseen_tail = tf.boolean_mask(new_filtered_tail_rank,
-                                                                           both_not_in_train_mask)
-
-                # unseen tail -> unseen head
-                open_unseen_tail_to_unseen_head = tf.boolean_mask(new_head_rank, both_not_in_train_mask)
-                open_filtered_unseen_tail_to_unseen_head = tf.boolean_mask(new_filtered_head_rank,
-                                                                           both_not_in_train_mask)
-
-                head_not_in_tail_in_mask = tf.logical_and(tf.logical_not(head_in_train),
-                                                          tail_in_train)
-                # unseen head -> seen tail
-                open_unseen_head_to_seen_tail = tf.boolean_mask(new_tail_rank, head_not_in_tail_in_mask)
-                open_filtered_unseen_head_to_seen_tail = tf.boolean_mask(new_filtered_tail_rank,
-                                                                         head_not_in_tail_in_mask)
-
-                head_in_tail_not_in_mask = tf.logical_and(head_in_train, tf.logical_not(tail_in_train))
-                # unseen tail -> seen head
-                open_unseen_tail_to_seen_head = tf.boolean_mask(new_head_rank, head_in_tail_not_in_mask)
-                open_filtered_unseen_tail_to_seen_head = tf.boolean_mask(new_filtered_head_rank,
-                                                                         head_in_tail_not_in_mask)
-
-                # seen head -> unseen tail
-                open_seen_head_to_unseen_tail = tf.boolean_mask(new_tail_rank, head_in_tail_not_in_mask)
-                open_filtered_seen_head_to_unseen_tail = tf.boolean_mask(new_filtered_tail_rank,
-                                                                         head_in_tail_not_in_mask)
-                # seen tail -> unseen head
-                open_seen_tail_to_unseen_head = tf.boolean_mask(new_head_rank, head_not_in_tail_in_mask)
-                open_filtered_seen_tail_to_unseen_head = tf.boolean_mask(new_filtered_head_rank,
-                                                                         head_not_in_tail_in_mask)
-
-                # Semi Open world
-                # Unseen to seen, the target entities are the seen entities only
-                # unseen head -> seen tail
-                semi_open_unseen_head_to_seen_tail = tf.boolean_mask(classic_tail_rank, head_not_in_tail_in_mask)
-                semi_open_filtered_unseen_head_to_seen_tail = tf.boolean_mask(classic_filtered_tail_rank,
-                                                                              head_not_in_tail_in_mask)
-                # unseen tail -> seen head
-                semi_open_unseen_tail_to_seen_head = tf.boolean_mask(classic_head_rank, head_in_tail_not_in_mask)
-                semi_open_filtered_unseen_tail_to_seen_head = tf.boolean_mask(classic_filtered_head_rank,
-                                                                              head_in_tail_not_in_mask)
-
-                with tf.name_scope('streaming_metrics'):
-                    metric_data = [
-                        [closed_head_pred_tail, 'closed_seen_head_to_seen_tail'],
-                        [closed_filtered_head_pred_tail, 'closed_seen_head_to_seen_tail_filtered'],
-
-                        [closed_tail_pred_head, 'closed_tail_pred_head'],
-                        [closed_filtered_tail_pred_head, 'closed_seen_tail_to_seen_head_filtered'],
-
-                        [tf.concat([closed_head_pred_tail, closed_tail_pred_head], axis=0), 'closed_mean_rank'],
-                        [tf.concat([closed_filtered_head_pred_tail, closed_filtered_tail_pred_head], axis=0),
-                         'closed_mean_rank_filtered'],
-
-                        [open_unseen_head_to_unseen_tail, 'open_unseen_head_to_unseen_tail'],
-                        [open_filtered_unseen_head_to_unseen_tail, 'open_unseen_head_to_unseen_tail_filtered'],
-
-                        [open_unseen_tail_to_unseen_head, 'open_unseen_tail_to_unseen_head'],
-                        [open_filtered_unseen_tail_to_unseen_head, 'open_unseen_tail_to_unseen_head_filtered'],
-
-                        [open_unseen_head_to_seen_tail, 'open_unseen_head_to_seen_tail'],
-                        [open_filtered_unseen_head_to_seen_tail, 'open_unseen_head_to_seen_tail_filtered'],
-
-                        [open_unseen_tail_to_seen_head, 'open_unseen_tail_to_seen_head'],
-                        [open_filtered_unseen_tail_to_seen_head, 'open_unseen_tail_to_seen_head_filtered'],
-
-                        [open_seen_head_to_unseen_tail, 'open_seen_head_to_unseen_tail'],
-                        [open_filtered_seen_head_to_unseen_tail, 'open_seen_head_to_unseen_tail_filtered'],
-
-                        [open_seen_tail_to_unseen_head, 'open_seen_tail_to_unseen_head'],
-                        [open_filtered_seen_tail_to_unseen_head, 'open_seen_tail_to_unseen_head_filtered'],
-
-                        [semi_open_unseen_head_to_seen_tail, 'semi_open_unseen_head_to_seen_tail'],
-                        [semi_open_filtered_unseen_head_to_seen_tail, 'semi_open_unseen_head_to_seen_tail_filtered'],
-
-                        [semi_open_unseen_tail_to_seen_head, 'semi_open_unseen_tail_to_seen_head'],
-                        [semi_open_filtered_unseen_tail_to_seen_head, 'semi_open_unseen_tail_to_seen_head_filtered'],
-
-                        [tf.concat([open_unseen_head_to_unseen_tail,
-                                    open_unseen_tail_to_unseen_head,
-                                    open_unseen_head_to_seen_tail,
-                                    open_unseen_tail_to_seen_head,
-                                    open_seen_head_to_unseen_tail,
-                                    open_seen_tail_to_unseen_head], axis=0),
-                         'open_mean_rank'],
-                        [tf.concat([open_filtered_unseen_head_to_unseen_tail,
-                                    open_filtered_unseen_tail_to_unseen_head,
-                                    open_filtered_unseen_head_to_seen_tail,
-                                    open_filtered_unseen_tail_to_seen_head,
-                                    open_filtered_seen_head_to_unseen_tail,
-                                    open_filtered_seen_tail_to_unseen_head], axis=0),
-                         'open_mean_rank_filtered'],
-
-                        [tf.concat([semi_open_unseen_head_to_seen_tail,
-                                    semi_open_unseen_tail_to_seen_head], axis=0),
-                         'semi_open_mean_rank'],
-                        [tf.concat([semi_open_filtered_unseen_head_to_seen_tail,
-                                    semi_open_filtered_unseen_tail_to_seen_head], axis=0),
-                         'semi_open_mean_rank_filtered']
-
-                    ]
-                    update_ops = list()
-
-                    for v, k in metric_data:
-                        m, u = metrics.streaming_mean(v, name=k)
-                        tf.summary.scalar(k, m, collections=[self.EVAL_SUMMARY])
-                        update_ops.append(u)
-
-                tf.logging.info("[%s] classic_head_rank %s "
-                                "classic_filtered_head_rank %s "
-                                "classic_tail_rank %s "
-                                "classic_filtered_tail_rank %s "
-                                "new_head_rank %s "
-                                "new_filtered_head_rank %s "
-                                "new_tail_rank %s "
-                                "new_filtered_tail_rank %s " % (sys._getframe().f_code.co_name,
-                                                                classic_head_rank.get_shape(),
-                                                                classic_filtered_head_rank.get_shape(),
-                                                                classic_tail_rank.get_shape(),
-                                                                classic_filtered_tail_rank.get_shape(),
-                                                                new_head_rank.get_shape(),
-                                                                new_filtered_head_rank.get_shape(),
-                                                                new_tail_rank.get_shape(),
-                                                                new_filtered_tail_rank.get_shape()))
-
-                eval_result = {
-                    'closed':
-                        {
-                            'head': {
-                                'rank': classic_head_rank,
-                                'frank': classic_filtered_head_rank,
-                            },
-                            'tail ': {
-                                'rank': classic_tail_rank,
-                                'frank': classic_filtered_tail_rank,
-                            },
-                            'head_same': all_closed_heads_eq,
-                            'tail_same': all_closed_tails_eq,
-                        },
-                    'open':
-                        {
-                            'head': {
-                                'rank': new_head_rank,
-                                'frank': new_filtered_head_rank,
-                            },
-                            'tail': {
-                                'rank': new_tail_rank,
-                                'frank': new_filtered_tail_rank
-                            },
-                            'head_same': all_open_heads_eq,
-                            'tail_same': all_open_tails_eq,
-                        },
-                }
-
-                return ph_evaluation_triples, enqueue_triple, str_triple_batch, eval_result, tf.group(*update_ops)
+                return ph_head_rel, ph_eval_targets, ph_true_target_idx, \
+                       ph_test_target_idx, enqueue_op, ranks, rr, rand_ranks, rand_rr
 
 
 def main(_):
@@ -1609,6 +1330,8 @@ def main(_):
     tf.logging.set_verbosity(tf.logging.INFO)
     CHECKPOINT_DIR = sys.argv[1]
     dataset_dir = sys.argv[2]
+
+    is_train = not (len(sys.argv) == 4 and sys.argv[3] == 'eval')
 
     model = ContentModel(entity_file=os.path.join(dataset_dir, 'entities.txt'),
                          relation_file=os.path.join(dataset_dir, 'relations.txt'),
@@ -1634,21 +1357,28 @@ def main(_):
 
                          train_file=os.path.join(dataset_dir, 'train.txt'),
 
-                         num_epoch=10,
                          word_oov=100,
                          word_embedding_size=200,
                          debug=True)
 
     model.create('/cpu:0')
-    train_op, loss_op, merge_ops = model.train_ops(num_epoch=100, batch_size=200,
-                                                   sampled_true=1, sampled_false=31,
-                                                   devices=['/gpu:0', '/gpu:1', '/gpu:2'])
-    ph_eval_triples, triple_enqueue_op, batch_data_op, batch_pred_score_op, metric_update_ops = model.auto_eval_ops(
-        batch_size=1,
-        n_splits=2000,
-        device='/gpu:3')
-    metric_reset_op = tf.variables_initializer([i for i in tf.local_variables() if 'streaming_metrics' in i.name])
-    metric_merge_op = tf.summary.merge_all(model.EVAL_SUMMARY)
+    if is_train:
+        train_op, loss_op, merge_ops = model.train_ops(lr=1e-4, num_epoch=100, batch_size=200,
+                                                       sampled_true=1, sampled_false=4,
+                                                       devices=['/gpu:0', '/gpu:1', '/gpu:2'])
+    else:
+        tf.logging.info("Evaluate mode")
+        # ph_head_rel, ph_eval_targets, ph_true_target_idx, \
+        # ph_test_target_idx, eval_op, ranks, rr, rand_ranks, rand_rr = model.manual_eval_ops('/gpu:3')
+
+        ph_head_rel, ph_eval_targets, ph_target_size, q_size, ph_true_target_idx, \
+        ph_test_target_idx, pre_compute_tails, re_enqueue, dequeue_op, ranks, rr, rand_ranks, rand_rr = model.manual_eval_ops_v2(
+            '/gpu:3')
+
+    # metric_reset_op = tf.variables_initializer([i for i in tf.local_variables() if 'streaming_metrics' in i.name])
+    # metric_merge_op = tf.summary.merge_all(model.EVAL_SUMMARY)
+
+    EVAL_BATCH = 500
 
     config = tf.ConfigProto()
     # config.graph_options.optimizer_options.global_jit_level = tf.OptimizerOptions.ON_1
@@ -1657,10 +1387,8 @@ def main(_):
     config.gpu_options.allow_growth = True
     config.gpu_options.per_process_gpu_memory_fraction = 0.95
 
-    saver = tf.train.Saver(max_to_keep=3, var_list=tf.trainable_variables() + [model.global_step])
-
     # Evaluation dataset is here
-    validation_data = load_triples(os.path.join(dataset_dir, 'valid.txt'))
+    # validation_data = load_triples(os.path.join(dataset_dir, 'valid.txt'))
     # ph, trip = model.auto_eval_ops(len(validation_data), batch_size=3)
 
     with tf.Session(config=config) as sess:
@@ -1688,6 +1416,8 @@ def main(_):
         tf.logging.info("avoid targets %s" % avoid_targets)
 
         os.makedirs(CHECKPOINT_DIR, exist_ok=True)
+        saver = tf.train.Saver(max_to_keep=3, var_list=tf.trainable_variables() + [model.global_step])
+
         try:
             if os.path.exists(os.path.join(CHECKPOINT_DIR, 'checkpoint')):
                 saver.restore(sess=sess, save_path=tf.train.latest_checkpoint(CHECKPOINT_DIR))
@@ -1698,50 +1428,229 @@ def main(_):
                              "We will keep running but be aware that parts of your model are"
                              " RANDOM MATRICES!")
         tf.logging.info("Start training...")
-        train_writer = tf.summary.FileWriter(CHECKPOINT_DIR, sess.graph, flush_secs=60)
-        try:
-            global_step = sess.run(model.global_step)
-            while not coord.should_stop():
+        if is_train:
+            train_writer = tf.summary.FileWriter(CHECKPOINT_DIR, sess.graph, flush_secs=60)
 
-                if global_step % 10 == 0:
-                    if global_step % 500 == 0:
-                        _, loss, global_step, merged, merged_slow = sess.run(
-                            [train_op, loss_op, model.global_step, merge_ops[0], merge_ops[1]])
+            try:
+                global_step = sess.run(model.global_step)
+                while not coord.should_stop():
+
+                    if global_step % 10 == 0:
+                        if global_step % 500 == 0:
+                            _, loss, global_step, merged, merged_slow = sess.run(
+                                [train_op, loss_op, model.global_step, merge_ops[0], merge_ops[1]])
+                            train_writer.add_summary(merged, global_step)
+                            train_writer.add_summary(merged_slow, global_step)
+                        else:
+                            _, loss, global_step, merged = sess.run(
+                                [train_op, loss_op, model.global_step, merge_ops[0]])
                         train_writer.add_summary(merged, global_step)
-                        train_writer.add_summary(merged_slow, global_step)
                     else:
-                        _, loss, global_step, merged = sess.run([train_op, loss_op, model.global_step, merge_ops[0]])
-                    train_writer.add_summary(merged, global_step)
-                else:
-                    _, loss, global_step = sess.run([train_op, loss_op, model.global_step])
+                        _, loss, global_step = sess.run([train_op, loss_op, model.global_step])
 
-                print("global_step %d loss %.4f" % (global_step, loss), end='\r')
+                    print("global_step %d loss %.4f" % (global_step, loss), end='\r')
 
-                if global_step % 1000 == 0:
-                    print("Saving model@%d" % global_step)
-                    saver.save(sess, os.path.join(CHECKPOINT_DIR, 'model.ckpt'), global_step=global_step)
-                    print("Saved.")
+                    if global_step % 1000 == 0:
+                        print("Saving model@%d" % global_step)
+                        saver.save(sess, os.path.join(CHECKPOINT_DIR, 'model.ckpt'), global_step=global_step)
+                        print("Saved.")
 
-                    # feed evaluation data and reset metric scores
-                    sess.run([triple_enqueue_op, metric_reset_op],
-                             feed_dict={ph_eval_triples: validation_data})
-                    s = 0
-                    while s < len(validation_data):
-                        sess.run([metric_update_ops])
-                        s += min(len(validation_data) - s, 10)
-                        print("evaluated %d elements" % s)
-                    train_writer.add_summary(sess.run(metric_merge_op), global_step)
-                    print("evaluation done")
+            except tf.errors.OutOfRangeError:
+                print("training done")
+            finally:
+                coord.request_stop()
 
-        except tf.errors.OutOfRangeError:
-            print("training done")
-        finally:
-            coord.request_stop()
+            coord.join(threads)
 
-        coord.join(threads)
+            saver.save(sess, os.path.join(CHECKPOINT_DIR, "model.ckpt"), global_step=model.global_step)
+            tf.logging.info("Model saved with %d global steps." % sess.run(model.global_step))
+        else:
+            # First load evaluation data
+            # {rel : {head : [tails]}}
+            evaluation_data = load_manual_evaluation_file_by_rel(os.path.join(dataset_dir, 'test.txt'),
+                                                                 os.path.join(dataset_dir, 'avoid_entities.txt'))
 
-        saver.save(sess, os.path.join(CHECKPOINT_DIR, "model.ckpt"), global_step=model.global_step)
-        tf.logging.info("Model saved with %d global steps." % sess.run(model.global_step))
+            relation_specific_targets = load_relation_specific_targets(
+                os.path.join(dataset_dir, 'train.heads.idx'),
+                os.path.join(dataset_dir, 'relations.txt'))
+            filtered_targets = load_filtered_targets(os.path.join(dataset_dir, 'eval.tails.idx'),
+                                                     os.path.join(dataset_dir, 'eval.tails.values.closed'))
+
+            all_ranks = list()
+            all_rr = list()
+            all_multi_rr = list()
+
+            random_ranks = list()
+            random_rr = list()
+            random_multi_rr = list()
+
+            # Randomly assign some values to the targets, and then run the evaluation
+
+            # New evaluation method - evaluate by relationship
+            missed = 0
+            for c, rel_str in enumerate(evaluation_data.keys()):
+
+                for head_str, eval_true_targets_set in evaluation_data[rel_str].items():
+
+                    if rel_str not in relation_specific_targets:
+                        tf.logging.warning("Relation %s does not have any valid targets!" % rel_str)
+                        continue
+                    # First pre-compute the target embeddings
+                    eval_targets_set = relation_specific_targets[rel_str]
+                    eval_targets = list(eval_targets_set)
+
+                    tf.logging.debug("\nRelation %s : %d" % (rel_str, len(eval_targets)))
+                    start = 0
+                    while start < len(eval_targets):
+                        end = min(start + EVAL_BATCH, len(eval_targets))
+                        sess.run(pre_compute_tails, feed_dict={ph_eval_targets: [eval_targets[start:end]]})
+                        start = end
+
+                    assert sess.run(q_size) == len(eval_targets)
+
+                    head_rel = [[head_str, rel_str]]
+                    head_rel_str = "\t".join([head_str, rel_str])
+
+                    # Find true targets (in train/valid/test) of the given head relation
+                    # in the evaluation set and skip all others
+                    true_targets = set(filtered_targets[head_rel_str]).intersection(eval_targets_set)
+
+                    # find true evaluation targets in the test set that are in this set
+                    eval_true_targets = set.intersection(eval_targets_set, eval_true_targets_set)
+
+                    # how many true targets we missed/filtered out
+                    missed += len(eval_true_targets_set) - len(eval_true_targets)
+
+                    test_target_idx = sorted([eval_targets.index(x) for x in eval_true_targets])
+                    true_target_idx = sorted([eval_targets.index(x) for x in true_targets])
+
+                    assert len(true_target_idx) >= len(test_target_idx)
+
+                    _ranks, _rr, _rand_ranks, _rand_rr, _ = sess.run([ranks, rr, rand_ranks, rand_rr, re_enqueue],
+                                                                     feed_dict={ph_head_rel: head_rel,
+                                                                                ph_target_size: len(eval_targets_set),
+                                                                                ph_true_target_idx: true_target_idx,
+                                                                                ph_test_target_idx: test_target_idx})
+
+                    assert sess.run(q_size) == len(eval_targets)
+
+                    all_ranks.extend([float(x) for x in _ranks])
+                    all_rr.append(_rr)
+                    all_multi_rr.extend([1.0 / float(x) for x in _ranks])
+
+                    random_ranks.extend([float(x) for x in _rand_ranks])
+                    random_rr.append(_rand_rr)
+                    random_multi_rr.extend([1.0 / float(x) for x in _rand_ranks])
+
+                    print("%d/%d %d "
+                          "MR %.4f (%.4f) "
+                          "MRR(per head,rel) %.4f (%.4f) "
+                          "MRR(per tail) %.4f (%.4f) missed %d" % (
+                              c, len(evaluation_data), len(all_ranks),
+                              np.mean(all_ranks), np.mean(random_ranks),
+                              np.mean(all_rr), np.mean(random_rr),
+                              np.mean(all_multi_rr), np.mean(random_multi_rr),
+                              missed), end='\r')
+                    # clean up precomputed targets
+                    sess.run(dequeue_op, feed_dict={ph_target_size: len(eval_targets_set)})
+                    assert sess.run(q_size) == 0
+            # missed = 0
+            # for c, (head_rel_str, eval_true_targets_set) in enumerate(evaluation_data.items()):
+            #     head_str, rel_str = head_rel_str.split('\t')
+            #     # [1, 2]
+            #     head_rel = [[head_str, rel_str]]
+            #
+            #     if rel_str not in relation_specific_targets:
+            #         tf.logging.warning("Relation %s does not have any valid targets!" % rel_str)
+            #     elif len(eval_true_targets_set) == 0:
+            #         tf.logging.warning("%s->%s->? has 0 targets" % (head_str, rel_str))
+            #     else:
+            #         # targets we will evaluate in this batch, all other targets will be
+            #         # ignored and consider as irrelevant
+            #         eval_targets_set = relation_specific_targets[rel_str]
+            #
+            #         # TODO: Performance: If eval_targets_set is too large, break it into small batches instead
+            #
+            #         # Find true targets (in train/valid/test) of the given head relation
+            #         # in the evaluation set and skip all others
+            #         true_targets = set(filtered_targets[head_rel_str]).intersection(eval_targets_set)
+            #         # for v in true_targets:
+            #         #     assert v in eval_targets_set
+            #
+            #         # find true evaluation targets in the test set that are in this set
+            #         eval_true_targets = set.intersection(eval_targets_set, eval_true_targets_set)
+            #         # for v in eval_true_targets:
+            #         #     assert v in eval_targets_set
+            #
+            #         # how many true targets we missed/filtered out
+            #         missed += len(eval_true_targets_set) - len(eval_true_targets)
+            #
+            #         if len(eval_true_targets) == 0:
+            #             tf.logging.debug("find %s/%s true evaluation targets in the evaluation set" % (
+            #                 len(eval_true_targets),
+            #                 len(eval_true_targets_set)))
+            #         else:
+            #             eval_targets = list(eval_targets_set)
+            #
+            #             test_target_idx = sorted([eval_targets.index(x) for x in eval_true_targets])
+            #             true_target_idx = sorted([eval_targets.index(x) for x in true_targets])
+            #
+            #             # filter target set always is a superset of evaluation target set
+            #             assert len(true_target_idx) >= len(test_target_idx)
+            #
+            #             # print("head rel", head_rel_str)
+            #             # print("true_targets: ", [eval_targets[x] for x in true_target_idx])
+            #             # print("eval_true_targets: ", [eval_targets[x] for x in test_target_idx])
+            #             # print("eval_targets:", eval_targets)
+            #
+            #             # First calculate the scores and put then into a queue for future analysis
+            #             start = 0
+            #             while start < len(eval_targets):
+            #                 end = min(start + EVAL_BATCH, len(eval_targets))
+            #                 sess.run(eval_op, feed_dict={ph_head_rel: head_rel,
+            #                                              ph_eval_targets: [eval_targets[start:end]]})
+            #                 start = end
+            #
+            #             eval_dict = {ph_head_rel: head_rel,
+            #                          ph_true_target_idx: true_target_idx,
+            #                          ph_test_target_idx: test_target_idx}
+            #             _rand_ranks, _rand_rr = sess.run([rand_ranks, rand_rr], feed_dict=eval_dict)
+            #
+            #             _ranks, _rr = sess.run([ranks, rr], feed_dict=eval_dict)
+            #             # print(len(eval_true_targets), " target ranks", _ranks)
+            #             # print("scores", _scores)
+            #             # print("masked scores", _masked_scores.shape)
+            #             # print("pred scores", _pred_scores.shape)
+            #             all_ranks.extend([float(x) for x in _ranks])
+            #             all_rr.append(_rr)
+            #             all_multi_rr.extend([1.0 / float(x) for x in _ranks])
+            #
+            #             random_ranks.extend([float(x) for x in _rand_ranks])
+            #             random_rr.append(_rand_rr)
+            #             random_multi_rr.extend([1.0 / float(x) for x in _rand_ranks])
+            #
+            #             print("%d/%d %d "
+            #                   "MR %.4f (%.4f) "
+            #                   "MRR(per head,rel) %.4f (%.4f) "
+            #                   "MRR(per tail) %.4f (%.4f) missed %d" % (
+            #                       c, len(evaluation_data), len(all_ranks),
+            #                       np.mean(all_ranks), np.mean(random_ranks),
+            #                       np.mean(all_rr), np.mean(random_rr),
+            #                       np.mean(all_multi_rr), np.mean(random_multi_rr),
+            #                       missed), end='\r')
+            #             # exit(0)
+            print("")
+            print("%d "
+                  "MR %.4f (%.4f) "
+                  "MRR(per head,rel) %.4f (%.4f) "
+                  "MRR(per tail) %.4f (%.4f) missed %d" % (
+                      len(all_ranks),
+                      np.mean(all_ranks), np.mean(random_ranks),
+                      np.mean(all_rr), np.mean(random_rr),
+                      np.mean(all_multi_rr), np.mean(random_multi_rr),
+                      missed))
+
+            exit(0)
 
 
 if __name__ == '__main__':
