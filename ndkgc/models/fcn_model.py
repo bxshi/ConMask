@@ -1,3 +1,4 @@
+import csv
 from intbitset import intbitset
 
 from ndkgc.models.content_model import ContentModel
@@ -45,18 +46,18 @@ class FCNModel(ContentModel):
                                                                            tails.get_shape(),
                                                                            rels.get_shape(),
                                                                            device))
-            transformed_rels = self.__transform_relation(rels,
-                                                         reuse=reuse,
-                                                         device=device)
+            transformed_rels = self._transform_relation(rels,
+                                                        reuse=reuse,
+                                                        device=device)
 
-            transformed_head_content, transformed_head_title = self.__transform_head_entity(heads,
-                                                                                            transformed_rels,
-                                                                                            reuse=reuse,
-                                                                                            device=device)
-            transformed_tail_content, transformed_tail_title = self.__transform_tail_entity(tails,
-                                                                                            transformed_rels,
-                                                                                            reuse=True,
-                                                                                            device=device)
+            transformed_head_content, transformed_head_title = self._transform_head_entity(heads,
+                                                                                           transformed_rels,
+                                                                                           reuse=reuse,
+                                                                                           device=device)
+            transformed_tail_content, transformed_tail_title = self._transform_tail_entity(tails,
+                                                                                           transformed_rels,
+                                                                                           reuse=True,
+                                                                                           device=device)
 
             tf.logging.info("[%s] transformed_heads: %s "
                             "transformed_tails %s "
@@ -65,17 +66,17 @@ class FCNModel(ContentModel):
                                                      transformed_tail_content.get_shape(),
                                                      transformed_rels.get_shape()))
 
-            pred_scores = self.__predict(transformed_head_content,
-                                         transformed_head_title,
-                                         transformed_tail_content,
-                                         transformed_tail_title,
-                                         device=device,
-                                         reuse=reuse)
+            pred_scores = self._predict(transformed_head_content,
+                                        transformed_head_title,
+                                        transformed_tail_content,
+                                        transformed_tail_title,
+                                        device=device,
+                                        reuse=reuse)
 
             tf.logging.info("pred_scores %s" % (pred_scores))
             return pred_scores
 
-    def __predict(self, head_content, head_title, tail_content, tail_title, device='/cpu:0', reuse=True, name=None):
+    def _predict(self, head_content, head_title, tail_content, tail_title, device='/cpu:0', reuse=True, name=None):
         with tf.name_scope(name, 'predict', [head_content, head_title, tail_content, tail_title, self.predict_weight]):
             with tf.variable_scope(self.pred_scope, reuse=reuse):
                 with tf.device(device):
@@ -110,7 +111,7 @@ class FCNModel(ContentModel):
 
                     return pred_score
 
-    def __transform_relation(self, rels, reuse=True, device='/cpu:0', name=None):
+    def _transform_relation(self, rels, reuse=True, device='/cpu:0', name=None):
         """
 
         :param rels: Any shape
@@ -200,7 +201,7 @@ class FCNModel(ContentModel):
 
                 return extracted_ent_content, avg_title
 
-    def __transform_head_entity(self, heads, transformed_rels, reuse=True, device='/cpu:0', name=None):
+    def _transform_head_entity(self, heads, transformed_rels, reuse=True, device='/cpu:0', name=None):
         """
         This is used to extract entity description and titles.
         :param heads: [?, ?] <- due to evaluation, sometimes heads will be (1, ?) but transformed_rels will still be (batch, word_dim)
@@ -213,8 +214,93 @@ class FCNModel(ContentModel):
         """
         return self.__transform_entity(heads, transformed_rels, reuse, device, name='head_entity')
 
-    def __transform_tail_entity(self, tails, transformed_rels, reuse=True, device='/cpu:0', name=None):
+    def _transform_tail_entity(self, tails, transformed_rels, reuse=True, device='/cpu:0', name=None):
         return self.__transform_entity(tails, transformed_rels, reuse, device, name='tail_entity')
+
+    def manual_eval_ops_v2(self, device='/cpu:0'):
+        """ Manually evaluate one single partial triple with a given set of targets
+
+        This function will reduce the computation by reusing the targets of the same
+        relationships.
+
+        To use this method, first calculate the transformed tails of all the targets
+        and put them into a pipeline, then for each head, rel pair we fetch these precomputed
+        target representations and do the calculation to get the similarity score.
+
+        After we evaluated one type of relationship, one needs to manually clean up
+        the queue so it can be reused by next relationship.
+
+        :param device:
+        :return:
+        """
+
+        with tf.name_scope("manual_evaluation_v2"):
+            with tf.device(device):
+                # the input head, rel pair to evaluate
+                ph_head_rel = tf.placeholder(tf.string, [1, 2], name='ph_head_rel')
+                # tail targets to evaluate, this can be just part of the total targets
+                ph_eval_targets = tf.placeholder(tf.string, [1, None], name='ph_eval_targets')
+                # indices of true tail targets in the overall target list
+                ph_true_target_idx = tf.placeholder(tf.int32, [None], name='ph_true_target_idx')
+                # indices of true targets in the evaluation set
+                ph_test_target_idx = tf.placeholder(tf.int32, [None], name='ph_test_target_idx')
+
+                ph_target_size = tf.placeholder(tf.int32, (), name='ph_target_size')
+
+                # First, convert string to indices
+                str_heads, str_rels = tf.unstack(ph_head_rel, axis=1)
+                heads = self.entity_table.lookup(str_heads)
+                rels = self.relation_table.lookup(str_rels)
+
+                # A temporary queue for precomputed tails
+                pre_computed_tail_queue = tf.FIFOQueue(1000000, dtypes=[tf.float32, tf.float32],
+                                                       shapes=[[self.word_embedding_size], [self.word_embedding_size]],
+                                                       # This may needs to be change later
+                                                       name='tail_queue')
+
+                # Convert string targets to numerical ids
+                eval_tails = self.entity_table.lookup(ph_eval_targets)
+                # computed tails [1, ?, word_dim]
+                computed_rels = self._transform_relation(rels, reuse=True, device=device)
+                computed_content_tails, computed_title_tails = [tf.squeeze(x, axis=0) for x in
+                                                                self._transform_tail_entity(eval_tails, computed_rels,
+                                                                                            reuse=True, device=device)]
+
+                # put pre-computed tails into target queue
+                # Call this to pre-compute tails for a certain relationship
+                pre_compute_tails = pre_computed_tail_queue.enqueue_many([computed_content_tails, computed_title_tails])
+
+                # get pre-computed tails from target queue
+                dequeue_op = pre_computed_tail_queue.dequeue_many(ph_target_size)
+                tail_content_embeds, tail_title_embeds = [tf.expand_dims(x, axis=0) for x in dequeue_op]
+                # tf.logging.info("tail_embeds shape %s" % tail_embeds.get_shape())
+                # Put tails back into the queue (this will run after tails are dequeued)
+                with tf.control_dependencies(dequeue_op):
+                    re_enqueue = pre_computed_tail_queue.enqueue_many(dequeue_op)
+
+                # Calculate heads and tails
+                computed_content_heads, computd_title_heads = self._transform_head_entity(heads, computed_rels,
+                                                                                          reuse=True, device=device)
+
+                # This is the score of all the targets given a single partial triple
+                pred_scores = tf.reshape(self._predict(computed_content_heads,
+                                                       computd_title_heads,
+                                                       tail_content_embeds,
+                                                       tail_title_embeds,
+                                                       device=device,
+                                                       reuse=True), [-1, 1])
+
+                tf.logging.info("eval pred_scores %s" % pred_scores.get_shape())
+
+                ranks, rr = self.eval_helper(pred_scores, ph_test_target_idx, ph_true_target_idx)
+
+                rand_ranks, rand_rr = self.eval_helper(
+                    tf.random_uniform(tf.shape(pred_scores), minval=-1, maxval=1, dtype=tf.float32),
+                    ph_test_target_idx, ph_true_target_idx)
+
+                return ph_head_rel, ph_eval_targets, ph_target_size, pre_computed_tail_queue.size(), \
+                       ph_true_target_idx, ph_test_target_idx, \
+                       pre_compute_tails, re_enqueue, dequeue_op, ranks, rr, rand_ranks, rand_rr, pred_scores
 
 
 def main(_):
@@ -224,7 +310,7 @@ def main(_):
     CHECKPOINT_DIR = sys.argv[1]
     dataset_dir = sys.argv[2]
 
-    is_train = not(len(sys.argv) == 4 and sys.argv[3] == 'eval')
+    is_train = len(sys.argv) == 4 and sys.argv[3] != 'eval'
 
     model = FCNModel(entity_file=os.path.join(dataset_dir, 'entities.txt'),
                      relation_file=os.path.join(dataset_dir, 'relations.txt'),
@@ -264,7 +350,7 @@ def main(_):
     else:
         tf.logging.info("Evaluate mode")
         ph_head_rel, ph_eval_targets, ph_target_size, q_size, ph_true_target_idx, \
-        ph_test_target_idx, pre_compute_tails, re_enqueue, dequeue_op, ranks, rr, rand_ranks, rand_rr = model.manual_eval_ops_v2(
+        ph_test_target_idx, pre_compute_tails, re_enqueue, dequeue_op, ranks, rr, rand_ranks, rand_rr, _ = model.manual_eval_ops_v2(
             '/gpu:3')
 
     EVAL_BATCH = 500
@@ -307,8 +393,8 @@ def main(_):
         tf.logging.info("avoid targets %s" % avoid_targets)
 
         os.makedirs(CHECKPOINT_DIR, exist_ok=True)
-
         saver = tf.train.Saver(max_to_keep=3, var_list=tf.trainable_variables() + [model.global_step])
+
         try:
             if os.path.exists(os.path.join(CHECKPOINT_DIR, 'checkpoint')):
                 saver.restore(sess=sess, save_path=tf.train.latest_checkpoint(CHECKPOINT_DIR))
@@ -322,151 +408,204 @@ def main(_):
         tf.logging.info("Start training...")
         if is_train:
             train_writer = tf.summary.FileWriter(CHECKPOINT_DIR, sess.graph, flush_secs=60)
-        try:
-            global_step = sess.run(model.global_step)
-            while not coord.should_stop():
+            try:
+                global_step = sess.run(model.global_step)
+                while not coord.should_stop():
 
-                if is_train:
-                    if global_step % 10 == 0:
-                        if global_step % 500 == 0:
-                            _, loss, global_step, merged, merged_slow = sess.run(
-                                [train_op, loss_op, model.global_step, merge_ops[0], merge_ops[1]])
-                            train_writer.add_summary(merged_slow, global_step)
+                    if is_train:
+                        if global_step % 10 == 0:
+                            if global_step % 500 == 0:
+                                _, loss, global_step, merged, merged_slow = sess.run(
+                                    [train_op, loss_op, model.global_step, merge_ops[0], merge_ops[1]])
+                                train_writer.add_summary(merged_slow, global_step)
+                            else:
+                                _, loss, global_step, merged = sess.run(
+                                    [train_op, loss_op, model.global_step, merge_ops[0]])
+                            train_writer.add_summary(merged, global_step)
                         else:
-                            _, loss, global_step, merged = sess.run(
-                                [train_op, loss_op, model.global_step, merge_ops[0]])
-                        train_writer.add_summary(merged, global_step)
-                    else:
-                        _, loss, global_step = sess.run([train_op, loss_op, model.global_step])
+                            _, loss, global_step = sess.run([train_op, loss_op, model.global_step])
 
-                    print("global_step %d loss %.4f" % (global_step, loss), end='\r')
+                        print("global_step %d loss %.4f" % (global_step, loss), end='\r')
 
-                    if global_step % 1000 == 0:
-                        print("Saving model@%d" % global_step)
-                        saver.save(sess, os.path.join(CHECKPOINT_DIR, 'model.ckpt'), global_step=global_step)
-                        print("Saved.")
+                        if global_step % 1000 == 0:
+                            print("Saving model@%d" % global_step)
+                            saver.save(sess, os.path.join(CHECKPOINT_DIR, 'model.ckpt'), global_step=global_step)
+                            print("Saved.")
 
-                        # feed evaluation data and reset metric scores
-                        # sess.run([triple_enqueue_op, metric_reset_op, model.is_train.assign(False)],
-                        #          feed_dict={ph_eval_triples: validation_data})
-                        # s = 0
-                        # while s < len(validation_data):
-                        #     sess.run([metric_update_ops])
-                        #     s += min(len(validation_data) - s, EVAL_BATCH)
-                        #     print("evaluated %d elements" % s)
-                        # train_writer.add_summary(sess.run(metric_merge_op), global_step)
-                        # print("evaluation done")
-                        # sess.run(model.is_train.assign(True))
-                else:
-                    # First load evaluation data
-                    # {rel : {head : [tails]}}
-                    evaluation_data = load_manual_evaluation_file_by_rel(os.path.join(dataset_dir, 'test.txt'),
-                                                                         os.path.join(dataset_dir,
-                                                                                      'avoid_entities.txt'))
-                    tf.logging.info("Number of relationships in the evaluation file %d" % len(evaluation_data))
-                    relation_specific_targets = load_relation_specific_targets(
-                        os.path.join(dataset_dir, 'train.heads.idx'),
-                        os.path.join(dataset_dir, 'relations.txt'))
-                    filtered_targets = load_filtered_targets(os.path.join(dataset_dir, 'eval.tails.idx'),
-                                                             os.path.join(dataset_dir, 'eval.tails.values.closed'))
+                            # feed evaluation data and reset metric scores
+                            # sess.run([triple_enqueue_op, metric_reset_op, model.is_train.assign(False)],
+                            #          feed_dict={ph_eval_triples: validation_data})
+                            # s = 0
+                            # while s < len(validation_data):
+                            #     sess.run([metric_update_ops])
+                            #     s += min(len(validation_data) - s, EVAL_BATCH)
+                            #     print("evaluated %d elements" % s)
+                            # train_writer.add_summary(sess.run(metric_merge_op), global_step)
+                            # print("evaluation done")
+                            # sess.run(model.is_train.assign(True))
+            except tf.errors.OutOfRangeError:
+                print("training done")
+            finally:
+                coord.request_stop()
 
-                    all_ranks = list()
-                    all_rr = list()
-                    all_multi_rr = list()
+            coord.join(threads)
 
-                    random_ranks = list()
-                    random_rr = list()
-                    random_multi_rr = list()
+        else:
 
-                    # Randomly assign some values to the targets, and then run the evaluation
+            # Set mode to evaluation
+            sess.run(model.is_train.assign(False))
+            print(sess.run(model.is_train))
+            # ph_head_rel, ph_eval_targets, ph_true_target_idx, ph_test_target_idx, ranks, rr
 
-                    # New evaluation method - evaluate by relationship
-                    missed = 0
-                    for c, rel_str in enumerate(evaluation_data.keys()):
+            # First load evaluation data
+            # {rel : {head : [tails]}}
+            evaluation_data = load_manual_evaluation_file_by_rel(os.path.join(dataset_dir, 'test.txt'),
+                                                                 os.path.join(dataset_dir, 'avoid_entities.txt'))
+            tf.logging.info("Number of relationships in the evaluation file %d" % len(evaluation_data))
+            relation_specific_targets = load_relation_specific_targets(
+                os.path.join(dataset_dir, 'train.heads.idx'),
+                os.path.join(dataset_dir, 'relations.txt'))
+            filtered_targets = load_filtered_targets(os.path.join(dataset_dir, 'eval.tails.idx'),
+                                                     os.path.join(dataset_dir, 'eval.tails.values.closed'))
 
-                        if rel_str not in relation_specific_targets:
-                            tf.logging.warning("Relation %s does not have any valid targets!" % rel_str)
-                            continue
-                        # First pre-compute the target embeddings
-                        eval_targets_set = relation_specific_targets[rel_str]
-                        eval_targets = list(eval_targets_set)
+            fieldnames = ['relationship', 'mean_rank', 'mrr', 'mrr_per_triple', 'rand_mean_rank', 'rand_mrr',
+                          'rand_mrr_per_triple', 'miss', 'triples', 'targets']
+            csvfile = open(os.path.join(CHECKPOINT_DIR, 'eval.%d.csv' % sess.run(model.global_step)), 'w', newline='')
+            csv_writer = csv.DictWriter(csvfile, fieldnames)
+            csv_writer.writeheader()
 
-                        tf.logging.debug("\nRelation %s : %d" % (rel_str, len(eval_targets)))
-                        start = 0
-                        while start < len(eval_targets):
-                            end = min(start + EVAL_BATCH, len(eval_targets))
-                            sess.run(pre_compute_tails, feed_dict={ph_eval_targets: [eval_targets[start:end]]})
-                            start = end
+            all_ranks = list()
+            all_rr = list()
+            all_multi_rr = list()
 
-                        assert sess.run(q_size) == len(eval_targets)
+            random_ranks = list()
+            random_rr = list()
+            random_multi_rr = list()
 
-                        for head_str, eval_true_targets_set in evaluation_data[rel_str].items():
-                            head_rel = [[head_str, rel_str]]
-                            head_rel_str = "\t".join([head_str, rel_str])
+            # Randomly assign some values to the targets, and then run the evaluation
 
-                            # Find true targets (in train/valid/test) of the given head relation
-                            # in the evaluation set and skip all others
-                            true_targets = set(filtered_targets[head_rel_str]).intersection(eval_targets_set)
+            # New evaluation method - evaluate by relationship
+            missed = 0
+            trips = 0
+            for c, rel_str in enumerate(evaluation_data.keys()):
 
-                            # find true evaluation targets in the test set that are in this set
-                            eval_true_targets = set.intersection(eval_targets_set, eval_true_targets_set)
+                if rel_str not in relation_specific_targets:
+                    tf.logging.warning("Relation %s does not have any valid targets!" % rel_str)
+                    continue
+                # First pre-compute the target embeddings
+                eval_targets_set = relation_specific_targets[rel_str]
+                eval_targets = list(eval_targets_set)
 
-                            # how many true targets we missed/filtered out
-                            missed += len(eval_true_targets_set) - len(eval_true_targets)
+                tf.logging.debug("\nRelation %s : %d" % (rel_str, len(eval_targets)))
+                start = 0
+                while start < len(eval_targets):
+                    end = min(start + EVAL_BATCH, len(eval_targets))
+                    sess.run(pre_compute_tails, feed_dict={ph_head_rel: [[rel_str, rel_str]],
+                                                           ph_eval_targets: [eval_targets[start:end]]})
+                    start = end
 
-                            test_target_idx = sorted([eval_targets.index(x) for x in eval_true_targets])
-                            true_target_idx = sorted([eval_targets.index(x) for x in true_targets])
+                assert sess.run(q_size) == len(eval_targets)
 
-                            assert len(true_target_idx) >= len(test_target_idx)
+                # Performance of a single relationship
+                rel_ranks = list()
+                rel_rr = list()
+                rel_multi_rr = list()
+                rel_random_ranks = list()
+                rel_random_rr = list()
+                rel_random_multi_rr = list()
+                rel_miss = 0
+                rel_trips = 0
+                for head_str, eval_true_targets_set in evaluation_data[rel_str].items():
+                    head_rel = [[head_str, rel_str]]
+                    head_rel_str = "\t".join([head_str, rel_str])
 
-                            _ranks, _rr, _rand_ranks, _rand_rr, _ = sess.run(
-                                [ranks, rr, rand_ranks, rand_rr, re_enqueue],
-                                feed_dict={ph_head_rel: head_rel,
-                                           ph_target_size: len(eval_targets_set),
-                                           ph_true_target_idx: true_target_idx,
-                                           ph_test_target_idx: test_target_idx})
+                    # Find true targets (in train/valid/test) of the given head relation
+                    # in the evaluation set and skip all others
+                    true_targets = set(filtered_targets[head_rel_str]).intersection(eval_targets_set)
 
-                            assert sess.run(q_size) == len(eval_targets)
+                    # find true evaluation targets in the test set that are in this set
+                    eval_true_targets = set.intersection(eval_targets_set, eval_true_targets_set)
 
-                            all_ranks.extend([float(x) for x in _ranks])
-                            all_rr.append(_rr)
-                            all_multi_rr.extend([1.0 / float(x) for x in _ranks])
+                    # how many true targets we missed/filtered out
+                    rel_miss += len(eval_true_targets_set) - len(eval_true_targets)
+                    missed += len(eval_true_targets_set) - len(eval_true_targets)
 
-                            random_ranks.extend([float(x) for x in _rand_ranks])
-                            random_rr.append(_rand_rr)
-                            random_multi_rr.extend([1.0 / float(x) for x in _rand_ranks])
+                    test_target_idx = sorted([eval_targets.index(x) for x in eval_true_targets])
+                    true_target_idx = sorted([eval_targets.index(x) for x in true_targets])
 
-                            print("%d/%d %d "
-                                  "MR %.4f (%.4f) "
-                                  "MRR(per head,rel) %.4f (%.4f) "
-                                  "MRR(per tail) %.4f (%.4f) missed %d" % (
-                                      c, len(evaluation_data), len(all_ranks),
-                                      np.mean(all_ranks), np.mean(random_ranks),
-                                      np.mean(all_rr), np.mean(random_rr),
-                                      np.mean(all_multi_rr), np.mean(random_multi_rr),
-                                      missed), end='\r')
-                            # clean up precomputed targets
-                        sess.run(dequeue_op, feed_dict={ph_target_size: len(eval_targets_set)})
-                        assert sess.run(q_size) == 0
-                    print("\n%d "
+                    assert len(true_target_idx) >= len(test_target_idx)
+
+                    _ranks, _rr, _rand_ranks, _rand_rr, _ = sess.run([ranks, rr, rand_ranks, rand_rr, re_enqueue],
+                                                                     feed_dict={ph_head_rel: head_rel,
+                                                                                ph_target_size: len(eval_targets_set),
+                                                                                ph_true_target_idx: true_target_idx,
+                                                                                ph_test_target_idx: test_target_idx})
+
+                    assert sess.run(q_size) == len(eval_targets)
+
+                    if len(_ranks):
+                        rel_ranks.extend([float(x) for x in _ranks])
+                        all_ranks.extend([float(x) for x in _ranks])
+                        all_rr.append(_rr)
+                        rel_rr.append(_rr)
+                        all_multi_rr.extend([np.max([1.0 / float(x) for x in _ranks])] * len(_ranks))
+                        rel_multi_rr.extend([np.max([1.0 / float(x) for x in _ranks])] * len(_ranks))
+
+                        random_ranks.extend([float(x) for x in _rand_ranks])
+                        rel_random_ranks.extend([float(x) for x in _rand_ranks])
+                        random_rr.append(_rand_rr)
+                        rel_random_rr.append(_rand_rr)
+                        random_multi_rr.extend([np.max([1.0 / float(x) for x in _rand_ranks])] * len(_rand_ranks))
+                        rel_random_multi_rr.extend([np.max([1.0 / float(x) for x in _rand_ranks])] * len(_rand_ranks))
+                        rel_trips += len(_ranks)
+                        trips += len(_ranks)
+                    print("%d/%d %d "
                           "MR %.4f (%.4f) "
                           "MRR(per head,rel) %.4f (%.4f) "
                           "MRR(per tail) %.4f (%.4f) missed %d" % (
-                              len(all_ranks),
+                              c + 1, len(evaluation_data), len(all_ranks),
                               np.mean(all_ranks), np.mean(random_ranks),
                               np.mean(all_rr), np.mean(random_rr),
                               np.mean(all_multi_rr), np.mean(random_multi_rr),
-                              missed))
+                              missed), end='\r')
+                    # clean up precomputed targets
+                sess.run(dequeue_op, feed_dict={ph_target_size: len(eval_targets_set)})
+                assert sess.run(q_size) == 0
 
-                    exit(0)
+                csv_writer.writerow({'relationship': rel_str,
+                                     'mean_rank': np.mean(rel_ranks),
+                                     'mrr': np.mean(rel_rr),
+                                     'mrr_per_triple': np.mean(rel_multi_rr),
+                                     'rand_mean_rank': np.mean(rel_random_ranks),
+                                     'rand_mrr': np.mean(rel_random_rr),
+                                     'rand_mrr_per_triple': np.mean(rel_random_multi_rr),
+                                     'miss': rel_miss,
+                                     'triples': rel_trips,
+                                     'targets': len(eval_targets_set)})
 
+            print("\n%d "
+                  "MR %.4f (%.4f) "
+                  "MRR(per head,rel) %.4f (%.4f) "
+                  "MRR(per tail) %.4f (%.4f) missed %d" % (
+                      len(all_ranks),
+                      np.mean(all_ranks), np.mean(random_ranks),
+                      np.mean(all_rr), np.mean(random_rr),
+                      np.mean(all_multi_rr), np.mean(random_multi_rr),
+                      missed))
 
-        except tf.errors.OutOfRangeError:
-            print("training done")
-        finally:
-            coord.request_stop()
+            csv_writer.writerow({'relationship': 'OVERALL',
+                                 'mean_rank': np.mean(all_ranks),
+                                 'mrr': np.mean(all_rr),
+                                 'mrr_per_triple': np.mean(all_multi_rr),
+                                 'rand_mean_rank': np.mean(random_ranks),
+                                 'rand_mrr': np.mean(random_rr),
+                                 'rand_mrr_per_triple': np.mean(random_multi_rr),
+                                 'miss': missed,
+                                 'triples': trips,
+                                 'targets': -1})
 
-        coord.join(threads)
+            csvfile.close()
+            exit(0)
 
 
 if __name__ == '__main__':

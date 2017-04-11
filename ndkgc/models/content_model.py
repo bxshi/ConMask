@@ -1,3 +1,4 @@
+import csv
 from intbitset import intbitset
 
 import tensorflow.contrib.layers as layers
@@ -513,7 +514,7 @@ class ContentModel(object):
 
                 return transformed_ents
 
-    def __transform_head_entity(self, heads, reuse=True, device='/cpu:0', name=None):
+    def _transform_head_entity(self, heads, reuse=True, device='/cpu:0', name=None):
         """
 
         :param heads: Any shape
@@ -559,7 +560,7 @@ class ContentModel(object):
                                                                 device=device)
                 return transformed_heads
 
-    def __transform_tail_entity(self, tails, reuse=True, device='/cpu:0', name=None):
+    def _transform_tail_entity(self, tails, reuse=True, device='/cpu:0', name=None):
         """
 
         :param tails: Any shape
@@ -605,7 +606,7 @@ class ContentModel(object):
 
                 return transformed_tails
 
-    def __transform_relation(self, rels, reuse=True, device='/cpu:0', name=None):
+    def _transform_relation(self, rels, reuse=True, device='/cpu:0', name=None):
         """
 
         :param rels: Any shape
@@ -644,7 +645,7 @@ class ContentModel(object):
                                                                      transformed_rels.get_shape()))
                 return transformed_rels
 
-    def __combine_head_relation(self, transformed_heads, transformed_rels, reuse=True, device='/cpu:0', name=None):
+    def _combine_head_relation(self, transformed_heads, transformed_rels, reuse=True, device='/cpu:0', name=None):
         """
 
         :param transformed_heads: [?, ?, word_dim]
@@ -662,7 +663,7 @@ class ContentModel(object):
                     # return transformed_heads + tf.expand_dims(transformed_rels, axis=1)
                     return transformed_heads + tf.expand_dims(transformed_rels, axis=1)
 
-    def __predict(self, combined_head_rel, tails, reuse=True, device='/cpu:0', name=None):
+    def _predict(self, combined_head_rel, tails, reuse=True, device='/cpu:0', name=None):
         """
 
         :param combined_head_rel: [?, ?, word_dim]
@@ -687,14 +688,14 @@ class ContentModel(object):
                                                                            tails.get_shape(),
                                                                            rels.get_shape(),
                                                                            device))
-            transformed_heads = self.__transform_head_entity(heads, reuse=reuse, device=device)
-            transformed_tails = self.__transform_tail_entity(tails, reuse=reuse, device=device)
-            transformed_rels = self.__transform_relation(rels, reuse=reuse, device=device)
+            transformed_heads = self._transform_head_entity(heads, reuse=reuse, device=device)
+            transformed_tails = self._transform_tail_entity(tails, reuse=reuse, device=device)
+            transformed_rels = self._transform_relation(rels, reuse=reuse, device=device)
 
-            combined_head_rel = self.__combine_head_relation(transformed_heads=transformed_heads,
-                                                             transformed_rels=transformed_rels,
-                                                             reuse=reuse,
-                                                             device=device)
+            combined_head_rel = self._combine_head_relation(transformed_heads=transformed_heads,
+                                                            transformed_rels=transformed_rels,
+                                                            reuse=reuse,
+                                                            device=device)
 
             tf.logging.info("[%s] transformed_heads: %s "
                             "transformed_tails %s "
@@ -703,7 +704,7 @@ class ContentModel(object):
                                                      transformed_tails.get_shape(),
                                                      transformed_rels.get_shape()))
 
-            return self.__predict(combined_head_rel, transformed_tails, reuse=True, device=device)
+            return self._predict(combined_head_rel, transformed_tails, reuse=True, device=device)
 
     def _train_helper(self, corrupt_head, ent, rel, true_targets, false_targets, device):
         with tf.name_scope('train', [corrupt_head, ent, rel, true_targets, false_targets]):
@@ -1162,7 +1163,7 @@ class ContentModel(object):
                 # Convert string targets to numerical ids
                 eval_tails = self.entity_table.lookup(ph_eval_targets)
                 # computed tails [1, ?, word_dim]
-                computed_tails = tf.squeeze(self.__transform_tail_entity(eval_tails, reuse=True, device=device), axis=0)
+                computed_tails = tf.squeeze(self._transform_tail_entity(eval_tails, reuse=True, device=device), axis=0)
 
                 # put pre-computed tails into target queue
                 # Call this to pre-compute tails for a certain relationship
@@ -1182,18 +1183,18 @@ class ContentModel(object):
                 rels = self.relation_table.lookup(str_rels)
 
                 # Calculate heads and tails
-                computed_heads = self.__transform_head_entity(heads, reuse=True, device=device)
-                computed_rels = self.__transform_relation(rels, reuse=True, device=device)
-                combined_head_rel = self.__combine_head_relation(transformed_heads=computed_heads,
-                                                                 transformed_rels=computed_rels,
-                                                                 reuse=True,
-                                                                 device=device)
+                computed_heads = self._transform_head_entity(heads, reuse=True, device=device)
+                computed_rels = self._transform_relation(rels, reuse=True, device=device)
+                combined_head_rel = self._combine_head_relation(transformed_heads=computed_heads,
+                                                                transformed_rels=computed_rels,
+                                                                reuse=True,
+                                                                device=device)
 
                 # This is the score of all the targets given a single partial triple
-                pred_scores = tf.reshape(self.__predict(combined_head_rel,
-                                                        tail_embeds,
-                                                        reuse=True,
-                                                        device=device), [-1, 1])
+                pred_scores = tf.reshape(self._predict(combined_head_rel,
+                                                       tail_embeds,
+                                                       reuse=True,
+                                                       device=device), [-1, 1])
 
                 tf.logging.info("eval pred_scores %s" % pred_scores.get_shape())
 
@@ -1205,7 +1206,7 @@ class ContentModel(object):
 
                 return ph_head_rel, ph_eval_targets, ph_target_size, pre_computed_tail_queue.size(), \
                        ph_true_target_idx, ph_test_target_idx, \
-                       pre_compute_tails, re_enqueue, dequeue_op, ranks, rr, rand_ranks, rand_rr
+                       pre_compute_tails, re_enqueue, dequeue_op, ranks, rr, rand_ranks, rand_rr, pred_scores
 
     @staticmethod
     def eval_helper(scores, test_target_idx, true_target_idx):
@@ -1321,7 +1322,7 @@ class ContentModel(object):
                                                                     minval=-1, maxval=1, dtype=tf.float32))
 
                 return ph_head_rel, ph_eval_targets, ph_true_target_idx, \
-                       ph_test_target_idx, enqueue_op, ranks, rr, rand_ranks, rand_rr
+                       ph_test_target_idx, enqueue_op, ranks, rr, rand_ranks, rand_rr, dequeue_op
 
 
 def main(_):
@@ -1370,7 +1371,7 @@ def main(_):
         tf.logging.info("Evaluate mode")
 
         ph_head_rel, ph_eval_targets, ph_target_size, q_size, ph_true_target_idx, \
-        ph_test_target_idx, pre_compute_tails, re_enqueue, dequeue_op, ranks, rr, rand_ranks, rand_rr = model.manual_eval_ops_v2(
+        ph_test_target_idx, pre_compute_tails, re_enqueue, dequeue_op, ranks, rr, rand_ranks, rand_rr, _ = model.manual_eval_ops_v2(
             '/gpu:3')
 
     # metric_reset_op = tf.variables_initializer([i for i in tf.local_variables() if 'streaming_metrics' in i.name])
@@ -1470,6 +1471,12 @@ def main(_):
             filtered_targets = load_filtered_targets(os.path.join(dataset_dir, 'eval.tails.idx'),
                                                      os.path.join(dataset_dir, 'eval.tails.values.closed'))
 
+            fieldnames = ['relationship', 'mean_rank', 'mrr', 'mrr_per_triple', 'rand_mean_rank', 'rand_mrr',
+                          'rand_mrr_per_triple', 'miss', 'triples', 'targets']
+            csvfile = open(os.path.join(CHECKPOINT_DIR, 'eval.%d.csv' % sess.run(model.global_step)), 'w', newline='')
+            csv_writer = csv.DictWriter(csvfile, fieldnames)
+            csv_writer.writeheader()
+
             all_ranks = list()
             all_rr = list()
             all_multi_rr = list()
@@ -1482,6 +1489,7 @@ def main(_):
 
             # New evaluation method - evaluate by relationship
             missed = 0
+            trips = 0
             for c, rel_str in enumerate(evaluation_data.keys()):
 
                 if rel_str not in relation_specific_targets:
@@ -1500,8 +1508,16 @@ def main(_):
 
                 assert sess.run(q_size) == len(eval_targets)
 
+                # Performance of a single relationship
+                rel_ranks = list()
+                rel_rr = list()
+                rel_multi_rr = list()
+                rel_random_ranks = list()
+                rel_random_rr = list()
+                rel_random_multi_rr = list()
+                rel_miss = 0
+                rel_trips = 0
                 for head_str, eval_true_targets_set in evaluation_data[rel_str].items():
-
                     head_rel = [[head_str, rel_str]]
                     head_rel_str = "\t".join([head_str, rel_str])
 
@@ -1513,6 +1529,7 @@ def main(_):
                     eval_true_targets = set.intersection(eval_targets_set, eval_true_targets_set)
 
                     # how many true targets we missed/filtered out
+                    rel_miss += len(eval_true_targets_set) - len(eval_true_targets)
                     missed += len(eval_true_targets_set) - len(eval_true_targets)
 
                     test_target_idx = sorted([eval_targets.index(x) for x in eval_true_targets])
@@ -1528,19 +1545,27 @@ def main(_):
 
                     assert sess.run(q_size) == len(eval_targets)
 
-                    all_ranks.extend([float(x) for x in _ranks])
-                    all_rr.append(_rr)
-                    all_multi_rr.extend([1.0 / float(x) for x in _ranks])
+                    if len(_ranks):
+                        rel_ranks.extend([float(x) for x in _ranks])
+                        all_ranks.extend([float(x) for x in _ranks])
+                        all_rr.append(_rr)
+                        rel_rr.append(_rr)
+                        all_multi_rr.extend([np.max([1.0 / float(x) for x in _ranks])] * len(_ranks))
+                        rel_multi_rr.extend([np.max([1.0 / float(x) for x in _ranks])] * len(_ranks))
 
-                    random_ranks.extend([float(x) for x in _rand_ranks])
-                    random_rr.append(_rand_rr)
-                    random_multi_rr.extend([1.0 / float(x) for x in _rand_ranks])
-
+                        random_ranks.extend([float(x) for x in _rand_ranks])
+                        rel_random_ranks.extend([float(x) for x in _rand_ranks])
+                        random_rr.append(_rand_rr)
+                        rel_random_rr.append(_rand_rr)
+                        random_multi_rr.extend([np.max([1.0 / float(x) for x in _rand_ranks])] * len(_rand_ranks))
+                        rel_random_multi_rr.extend([np.max([1.0 / float(x) for x in _rand_ranks])] * len(_rand_ranks))
+                        rel_trips += len(_ranks)
+                        trips += len(_ranks)
                     print("%d/%d %d "
                           "MR %.4f (%.4f) "
                           "MRR(per head,rel) %.4f (%.4f) "
                           "MRR(per tail) %.4f (%.4f) missed %d" % (
-                              c, len(evaluation_data), len(all_ranks),
+                              c + 1, len(evaluation_data), len(all_ranks),
                               np.mean(all_ranks), np.mean(random_ranks),
                               np.mean(all_rr), np.mean(random_rr),
                               np.mean(all_multi_rr), np.mean(random_multi_rr),
@@ -1548,6 +1573,18 @@ def main(_):
                     # clean up precomputed targets
                 sess.run(dequeue_op, feed_dict={ph_target_size: len(eval_targets_set)})
                 assert sess.run(q_size) == 0
+
+                csv_writer.writerow({'relationship': rel_str,
+                                     'mean_rank': np.mean(rel_ranks),
+                                     'mrr': np.mean(rel_rr),
+                                     'mrr_per_triple': np.mean(rel_multi_rr),
+                                     'rand_mean_rank': np.mean(rel_random_ranks),
+                                     'rand_mrr': np.mean(rel_random_rr),
+                                     'rand_mrr_per_triple': np.mean(rel_random_multi_rr),
+                                     'miss': rel_miss,
+                                     'triples': rel_trips,
+                                     'targets': len(eval_targets_set)})
+
             print("\n%d "
                   "MR %.4f (%.4f) "
                   "MRR(per head,rel) %.4f (%.4f) "
@@ -1558,6 +1595,18 @@ def main(_):
                       np.mean(all_multi_rr), np.mean(random_multi_rr),
                       missed))
 
+            csv_writer.writerow({'relationship': 'OVERALL',
+                                 'mean_rank': np.mean(all_ranks),
+                                 'mrr': np.mean(all_rr),
+                                 'mrr_per_triple': np.mean(all_multi_rr),
+                                 'rand_mean_rank': np.mean(random_ranks),
+                                 'rand_mrr': np.mean(random_rr),
+                                 'rand_mrr_per_triple': np.mean(random_multi_rr),
+                                 'miss': missed,
+                                 'triples': trips,
+                                 'targets': -1})
+
+            csvfile.close()
             exit(0)
 
 
