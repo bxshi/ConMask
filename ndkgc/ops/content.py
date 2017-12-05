@@ -1,6 +1,6 @@
 import tensorflow as tf
 import tensorflow.contrib.lookup as lookup
-from tensorflow.contrib.layers import xavier_initializer
+from tensorflow.contrib.layers import xavier_initializer, batch_norm
 
 
 def get_content_matrix(variable_scope, size, reuse=True, device='/cpu:0'):
@@ -100,10 +100,9 @@ def entity_content_embedding_lookup(entities, content, content_len, vocab_table,
             ent_content_dense = tf.sparse_tensor_to_dense(ent_content,
                                                           default_value=str_pad,
                                                           name='ent_content_dense')
-            # TODO: remove check numeric
-            ent_embedding = tf.check_numerics(tf.nn.embedding_lookup(word_embedding,
-                                                   vocab_table.lookup(ent_content_dense, name='ent_content_ids')),
-                                              'entity_content_embedding_lookup')
+            ent_embedding = tf.nn.embedding_lookup(word_embedding,
+                                                   vocab_table.lookup(ent_content_dense,
+                                                                      name='ent_content_ids'))
 
             return ent_embedding, content_len
 
@@ -184,8 +183,8 @@ def description_and_title_lookup(entities, content, content_len,
                                                                           str_pad,
                                                                           name='title')
 
-        tf.logging.info("flatten content_embedding %s title_embedding %s" % (content_embedding,
-                                                                             title_embedding))
+        tf.logging.debug("flatten content_embedding %s title_embedding %s" % (content_embedding,
+                                                                              title_embedding))
         # reshape [-1, content length, word_embedding_size]
         # to [????, content length, word_embedding_size]
         content_embedding, title_embedding = [tf.reshape(x,
@@ -196,8 +195,8 @@ def description_and_title_lookup(entities, content, content_len,
                                                   ['content_word_embedding',
                                                    'title_word_embedding'])]
 
-        tf.logging.info("content_embedding %s title_embedding %s" % (content_embedding,
-                                                                     title_embedding))
+        tf.logging.debug("content_embedding %s title_embedding %s" % (content_embedding,
+                                                                      title_embedding))
 
         content_true_len, title_true_len = [tf.reshape(x, tf.shape(entities), y) for x, y in
                                             zip([content_true_len, title_true_len],
@@ -261,6 +260,129 @@ def mask_content_embedding(entity_embeddings, relation_embeddings, prev_window_s
         return masked_content
 
 
+def extract_embedding_by_dkrl(content_embedding,
+                              filters,
+                              variable_scope, reuse=True, name=None):
+    """ Extract an embedding for each instance.
+
+    This is similar to DKRL, the first k-1 layers are using maxpooling and the last layer
+    uses mean pooling
+
+    :param content_embedding: [batch_size, n_entities, content_len, word_embedding]
+    :param filters: Number of filters in each CNN layer
+    :param variable_scope:
+    :param reuse:
+    :param name:
+    :return:
+    """
+
+    if len(content_embedding.get_shape()) != 4:
+        tf.logging.error("Content embedding must have a rank of 4, get %s" % (content_embedding))
+
+    with tf.name_scope(name, 'extract_embedding_by_dkrl', [content_embedding]):
+        with tf.variable_scope(variable_scope, reuse=reuse):
+            # Reshape the input to [batch, length, channel] so the conv1d has defined shapes
+            #  to declare new variables
+            conv_output = tf.reshape(content_embedding,
+                                     tf.stack([-1,  # batch size
+                                               tf.shape(content_embedding)[-2],  # content length
+                                               filters]))  # word_embed_size
+
+            conv_output = tf.layers.conv1d(conv_output,
+                                           filters=filters,
+                                           kernel_size=2,
+                                           strides=1,
+                                           padding='same',
+                                           activation=tf.nn.sigmoid,
+                                           # change loss to sigmoid to see if we can avoid the nan (without relu the loss will not reduce at all)
+                                           use_bias=True,
+                                           kernel_initializer=xavier_initializer(),
+                                           bias_initializer=xavier_initializer(),
+                                           trainable=True,
+                                           name='layer_1')
+            # conv_output = tf.check_numerics(conv_output, conv_output.name)
+
+            conv_output = tf.layers.max_pooling1d(conv_output,
+                                                  pool_size=4,
+                                                  strides=1,
+                                                  padding='same',
+                                                  name='layer_1_maxpool')
+
+            conv_output = tf.layers.conv1d(conv_output,
+                                           filters=filters,
+                                           kernel_size=2,
+                                           strides=1,
+                                           padding='same',
+                                           activation=tf.nn.sigmoid,
+                                           # change loss to sigmoid to see if we can avoid the nan (without relu the loss will not reduce at all)
+                                           use_bias=True,
+                                           kernel_initializer=xavier_initializer(),
+                                           bias_initializer=xavier_initializer(),
+                                           trainable=True,
+                                           name='layer_2')
+            # conv_output = tf.check_numerics(conv_output, conv_output.name)
+
+            conv_output = tf.reduce_mean(conv_output, axis=-2)
+
+            conv_output = tf.reshape(conv_output,
+                                     tf.stack([-1,
+                                               tf.shape(content_embedding)[1],
+                                               filters], axis=0),
+                                     # tf.concat([tf.shape(content_embedding)[:2],
+                                     #            [filters]], axis=0),
+                                     name='fcn_output')
+
+            tf.logging.debug("conv_output %s" % conv_output)
+
+            return conv_output
+
+            # # Reshape the input to [batch, length, channel] so the conv1d has defined shapes
+            # #  to declare new variables
+            # conv_output = tf.reshape(content_embedding,
+            #                          tf.stack([-1,
+            #                                    tf.shape(content_embedding)[-2],
+            #                                    filters]))
+            #
+            # conv_output = tf.layers.conv1d(conv_output,
+            #                                filters=filters,
+            #                                kernel_size=2,
+            #                                strides=1,
+            #                                padding='same',
+            #                                activation=tf.nn.sigmoid,
+            #                                use_bias=True,
+            #                                kernel_initializer=xavier_initializer(),
+            #                                trainable=True,
+            #                                name='layer_1')
+            # conv_output = tf.layers.max_pooling1d(conv_output,
+            #                                       pool_size=4,
+            #                                       strides=1,
+            #                                       name='layer_1_maxpool')
+            # conv_output = tf.layers.conv1d(conv_output,
+            #                                filters=filters,
+            #                                kernel_size=1,
+            #                                strides=1,
+            #                                padding='same',
+            #                                activation=tf.nn.sigmoid,
+            #                                use_bias=True,
+            #                                kernel_initializer=xavier_initializer(),
+            #                                trainable=True,
+            #                                name='layer_2')
+            #
+            # tf.logging.warning("layer_2 %s" % conv_output)
+            #
+            # # size is [batch, channel]
+            # conv_output = tf.reduce_mean(conv_output, axis=-2)
+            # tf.logging.warning("conv_output %s" % conv_output)
+            # conv_output = tf.reshape(conv_output,
+            #                          tf.concat([tf.shape(content_embedding)[:2],
+            #                                     tf.shape(conv_output)[1:]], axis=0),
+            #                          name='fcn_output')
+            #
+            # tf.logging.info("conv_output %s" % conv_output)
+            #
+            # return conv_output
+
+
 def extract_embedding_by_fcn(content_embedding,
                              conv_per_layer,
                              filters,
@@ -268,7 +390,9 @@ def extract_embedding_by_fcn(content_embedding,
                              is_train,
                              window_size,
                              keep_prob,
-                             variable_scope, reuse=True, name=None):
+                             variable_scope,
+                             activation=tf.nn.sigmoid,
+                             reuse=True, name=None):
     """
         Extract an embedding for each instance.
     :param content_embedding: [batch_size, n_entities, content_len, word_embedding]
@@ -286,7 +410,7 @@ def extract_embedding_by_fcn(content_embedding,
     if len(content_embedding.get_shape()) != 4:
         tf.logging.error("Content embedding must have a rank of 4, get %s" % content_embedding)
 
-    with tf.name_scope(name, 'extract_embedding', [content_embedding, is_train]):
+    with tf.name_scope(name, 'extract_embedding_by_fcn', [content_embedding, is_train]):
         with tf.variable_scope(variable_scope, reuse=reuse):
             # Reshape the input to [batch, length, channel] so the conv1d has defined shapes
             #  to declare new variables
@@ -307,14 +431,29 @@ def extract_embedding_by_fcn(content_embedding,
                                                    kernel_size=window_size,
                                                    strides=1,
                                                    padding='same',
-                                                   activation=tf.nn.sigmoid,  # change loss to sigmoid to see if we can avoid the nan (without relu the loss will not reduce at all)
+                                                   activation=activation,
+                                                   # change loss to sigmoid to see if we can avoid the nan (without relu the loss will not reduce at all)
                                                    use_bias=True,
                                                    kernel_initializer=xavier_initializer(),
                                                    bias_initializer=xavier_initializer(),
                                                    trainable=True,
                                                    name='layer_%d_conv_%d' % (layer_id, conv_layer_id))
-                    conv_output = tf.check_numerics(conv_output, conv_output.name)
+                    # conv_output = tf.check_numerics(conv_output, conv_output.name)
                 # add dropout if during training
+
+                conv_output = batch_norm(conv_output,
+                                         center=True,
+                                         scale=True,
+                                         is_training=is_train,
+                                         trainable=True,
+                                         scope='layer_%d_bn' % layer_id,
+                                         decay=0.9)
+
+                # conv_output = tf.layers.batch_normalization(conv_output,
+                #                                             training=is_train,
+                #                                             trainable=True,
+                #                                             name='layer_%d_bn' % layer_id)
+
                 conv_output = tf.cond(is_train,
                                       lambda: tf.nn.dropout(conv_output, keep_prob=keep_prob),
                                       lambda: conv_output)
@@ -329,13 +468,13 @@ def extract_embedding_by_fcn(content_embedding,
                                                           strides=2,
                                                           padding='same',
                                                           name='layer_%d_maxpool' % layer_id)
-                conv_output = tf.check_numerics(conv_output, conv_output.name)
+                # conv_output = tf.check_numerics(conv_output, conv_output.name)
 
             conv_output = tf.reshape(conv_output,
                                      tf.concat([tf.shape(content_embedding)[:2],
                                                 tf.shape(conv_output)[1:]], axis=0),
                                      name='fcn_output')
 
-            tf.logging.info("conv_output %s" % conv_output)
+            tf.logging.debug("conv_output %s" % conv_output)
 
             return conv_output

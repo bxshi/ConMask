@@ -123,25 +123,43 @@ def corrupt_single_entity_w_multiple_targets(triple: tf.Tensor,
                                              num_false: 5,
                                              head_corrupt_prob=0.5,
                                              name=None):
-    """
+    """ Generate a set of training triples using a correct one.
+
     Input triple is a string triple, and the output elements are all numerical ids
-    :param triple:
-    :param target_tail_table:
-    :param target_head_table:
-    :param target_tails:
-    :param target_heads:
-    :param avoid_entities:
-    :param entity_table:
-    :param relation_table:
-    :param max_entity_id:
-    :param num_true:
-    :param num_false:
-    :param head_corrupt_prob:
-    :param name:
+
+    :param triple: A given triple in shape of [1, 3]
+    :param target_tail_table: A HashTable, key is "\t".join([head, rel]) value is a
+                                numerical id pointing to the row in target_tails.
+    :param target_head_table: A HashTable, key is "\t".join([tail, rel]) value is a
+                                numerical id pointing to the row in target_heads.
+    :param target_tails: A TF matrix, each row is a string in format of " ".join(targets).
+                         Targets is a list of target name strings.
+    :param target_heads: A TF matrix, each row is a string in format of " ".join(targets).
+                         Targets is a list of target name strings.
+    :param avoid_entities: A TF tensor. This is a 1-D numerical id vector of all entities
+                            that are not seen during training.
+    :param entity_table: A HashTable, key is the entity string name,
+                            value is its numerical id.
+    :param relation_table: A HashTable, key is the relationship string name,
+                            value is its numerical id.
+    :param max_entity_id: The largest entity id in entity_table. Should be number
+                            of entities - 1.
+    :param num_true: Number of true targets we will sample.
+    :param num_false: Number of false targets we will sample.
+    :param head_corrupt_prob: The probability of head entity been corrupted. Default is 0.5
+    :param name: Optional name of this op.
     :return:
+        A tuple with 5 elements:
+            A boolean tf scalar of whether head entity is corrupted;
+            Numerical id of uncorrupted entity (can be head or tail);
+            Numerical id of the relationship;
+            [num_true] numerical id of sampled true targets;
+            [num_false] numerical id of sampled false targets
+
     """
-    with tf.name_scope(name, 'corrupt_single_entity_w_multiple_targets', [triple, target_tail_table, target_head_table,
-                                                                          target_tails, target_heads]):
+    with tf.name_scope(name, 'corrupt_single_entity_w_multiple_targets',
+                       [triple, target_tail_table, target_head_table, target_tails, target_heads]):
+        # Prob of head/tail corruption
         corrupt_rand = tf.random_uniform((), name='corrupt_rand')
         corrupt_head = tf.less(corrupt_rand, head_corrupt_prob, name='corrupt_cond')
 
@@ -163,6 +181,8 @@ def corrupt_single_entity_w_multiple_targets(triple: tf.Tensor,
 
         tf.logging.debug("[%s] selected true idx %s" % (sys._getframe().f_code.co_name,
                                                         selected_true_idx.get_shape()))
+
+        # Get the actual entity string name of sampled true targets
         sampled_true = tf.nn.embedding_lookup(true_targets, selected_true_idx, name='sampled_true_targets')
 
         # Now sample num_false negative targets that does not overlap with true_targets and avoid_entities
@@ -170,6 +190,7 @@ def corrupt_single_entity_w_multiple_targets(triple: tf.Tensor,
                                  lambda: tf.expand_dims(avoid_entities, axis=0),
                                  lambda: tf.reshape(avoid_entities, [-1]))
 
+        # when doing the negative sampling, ignore all avoid entities and true targets
         skip_targets = tf.concat([true_targets, avoid_entities], axis=-1)
         sampled_false = multiple_negative_sampling(targets=skip_targets,
                                                    max_range=max_entity_id,

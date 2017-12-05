@@ -6,6 +6,10 @@ import tensorflow.contrib.layers as layers
 from ndkgc.ops import *
 from ndkgc.utils import *
 
+"""
+    This model only averaging the content information, not including the title
+"""
+
 tf.app.flags.DEFINE_boolean('eval', False, 'Run evaluation')
 tf.app.flags.DEFINE_boolean('force_eval', False, 'Run evaluation during training instead of validation')
 tf.app.flags.DEFINE_integer('max_content', 256, 'Max content length')
@@ -13,7 +17,7 @@ tf.app.flags.DEFINE_integer('batch', 200, 'batch_size')
 FLAGS = tf.app.flags.FLAGS
 
 
-class ContentModel(object):
+class ContentAveragingModel(object):
     PAD = '__PAD__'
     PAD_const = tf.constant(PAD, name='pad')
 
@@ -176,6 +180,7 @@ class ContentModel(object):
             intbitset(list(mask_entity_dict.values()))).tolist()
         tf.logging.info("closed_entities size %d" % len(_closed_entities))
         self.closed_entities.load(_closed_entities, session=session)
+
         # Load entity description
         _entity_desc, _entity_desc_len = load_content(self.content_file,
                                                       entity_dict,
@@ -503,7 +508,6 @@ class ContentModel(object):
 
     @staticmethod
     def _entity_word_averaging(content_embedding, content_len,
-                               title_embedding, title_len,
                                padding_word_embedding, orig_shape, device, name=None):
         """ Calculate the averaging embedding of given entities.
 
@@ -523,17 +527,13 @@ class ContentModel(object):
             embeddings for each entity with the shape of orig_shape + [embedding_size].
         """
         with tf.name_scope(name, 'entity_word_averaging', [content_embedding, content_len,
-                                                           title_embedding, title_len,
                                                            padding_word_embedding, orig_shape]):
             with tf.device(device):
                 avg_content_embedding = avg_content(content_embedding, content_len,
                                                     padding_word_embedding,
                                                     name='avg_content_embedding')
-                avg_title_embedding = avg_content(title_embedding, title_len,
-                                                  padding_word_embedding,
-                                                  name='avg_title_embedding')
 
-                avg_embedding = avg_content_embedding + avg_title_embedding
+                avg_embedding = avg_content_embedding  # + avg_title_embedding
                 orig_embedding_shape = tf.concat([orig_shape, tf.shape(avg_embedding)[1:]], axis=0,
                                                  name='orig_head_embedding_shape')
 
@@ -585,8 +585,8 @@ class ContentModel(object):
                 pad_word_embedding = self.word_embedding[tf.cast(self.vocab_table.lookup(self.PAD_const), tf.int32), :]
                 transformed_heads = self._entity_word_averaging(content_embedding=head_content_embedding,
                                                                 content_len=head_content_len,
-                                                                title_embedding=head_title_embedding,
-                                                                title_len=head_title_len,
+                                                                # title_embedding=head_title_embedding,
+                                                                # title_len=head_title_len,
                                                                 padding_word_embedding=pad_word_embedding,
                                                                 orig_shape=orig_head_shape,
                                                                 device=device)
@@ -631,8 +631,8 @@ class ContentModel(object):
                 pad_word_embedding = self.word_embedding[tf.cast(self.vocab_table.lookup(self.PAD_const), tf.int32), :]
                 transformed_tails = self._entity_word_averaging(content_embedding=tail_content_embedding,
                                                                 content_len=tail_content_len,
-                                                                title_embedding=tail_title_embedding,
-                                                                title_len=tail_title_len,
+                                                                # title_embedding=tail_title_embedding,
+                                                                # title_len=tail_title_len,
                                                                 padding_word_embedding=pad_word_embedding,
                                                                 orig_shape=orig_tail_shape,
                                                                 device=device)
@@ -710,7 +710,8 @@ class ContentModel(object):
                            [combined_head_rel, tails]):
             with tf.variable_scope(self.pred_scope, reuse=reuse):
                 with tf.device(device):
-                    combined_head_rel, tails = [combined_head_rel, tails]
+                    combined_head_rel, tails = [tf.check_numerics(normalized_embedding(x), '__predict') for x in
+                                                [combined_head_rel, tails]]
                     return tf.reduce_sum(combined_head_rel * tails, axis=-1)
 
     def translate_triple(self, heads, tails, rels, device, reuse=True):
@@ -798,7 +799,7 @@ class ContentModel(object):
     def initialize(self, session):
         self._init_nontrainable_variables(session)
 
-    def train_ops(self, lr=0.01, lr_decay=False, num_epoch=10, batch_size=200,
+    def train_ops(self, lr=0.01, num_epoch=10, batch_size=200,
                   sampled_true=1, sampled_false=1, devices=list(['/cpu:0'])):
 
         # If only running on one device then calculate the grads on that device
@@ -808,12 +809,7 @@ class ContentModel(object):
             grad_dev = '/cpu:0'
 
         with tf.device(grad_dev):
-            if lr_decay:
-                optimizer = tf.train.AdamOptimizer(tf.train.exponential_decay(lr, self.global_step,
-                                                                              decay_steps=50000, decay_rate=0.98,
-                                                                              staircase=True))
-            else:
-                optimizer = tf.train.AdamOptimizer(lr)
+            optimizer = tf.train.AdamOptimizer(lr)
             tower_grads = list()
             losses = list()
             avg_positive_scores = list()
@@ -853,6 +849,8 @@ class ContentModel(object):
                                                                logits=pred_score)
 
                 grads = optimizer.compute_gradients(loss)
+                for grad in grads:
+                    print(grad)
                 tower_grads.append(grads)
                 losses.append(loss)
 
@@ -971,9 +969,9 @@ class ContentModel(object):
             # The output intersect's indices are in [0, x] format because there is only one row
             intersect = tf.sets.set_intersection(tf.reshape(ents, [1, -1]), tf.reshape(all_ents, [1, -1]))
             sparse_idx = tf.reshape(intersect.indices[:, 1], [-1, 1])
-            tf.logging.debug("sparse_idx index shape %s" % sparse_idx.get_shape())
+            tf.logging.info("sparse_idx index shape %s" % sparse_idx.get_shape())
             indicator_value = tf.ones_like(intersect.values, dtype=tf.bool)
-            tf.logging.debug("intersect indicator_value shape %s" % indicator_value.get_shape())
+            tf.logging.info("intersect indicator_value shape %s" % indicator_value.get_shape())
 
             indicator = tf.sparse_tensor_to_dense(tf.SparseTensor(indices=sparse_idx,
                                                                   values=indicator_value,
@@ -1016,7 +1014,7 @@ class ContentModel(object):
                 pre_computed_tail_queue = tf.FIFOQueue(1000000, dtypes=tf.float32,
                                                        shapes=[[self.word_embedding_size]],
                                                        # This may needs to be change later
-                                                       name='tail_queue__')
+                                                       name='tail_queue')
 
                 # Convert string targets to numerical ids
                 eval_tails = self.entity_table.lookup(ph_eval_targets)
@@ -1025,7 +1023,7 @@ class ContentModel(object):
 
                 # put pre-computed tails into target queue
                 # Call this to pre-compute tails for a certain relationship
-                pre_compute_tails = pre_computed_tail_queue.enqueue_many(computed_tails, name='first_enqueue')
+                pre_compute_tails = pre_computed_tail_queue.enqueue_many(computed_tails)
 
                 # get pre-computed tails from target queue
                 dequeue_op = pre_computed_tail_queue.dequeue_many(ph_target_size)
@@ -1102,7 +1100,7 @@ class ContentModel(object):
                 pre_computed_head_queue = tf.FIFOQueue(1000000, dtypes=tf.float32,
                                                        shapes=[[self.word_embedding_size]],
                                                        # This may needs to be change later
-                                                       name='tail_queue__')
+                                                       name='tail_queue')
 
                 # First, convert string to indices
                 str_tails, str_rels = tf.unstack(ph_tail_rel, axis=1)
@@ -1111,13 +1109,12 @@ class ContentModel(object):
 
                 # Convert string targets to numerical ids
                 eval_heads = self.entity_table.lookup(ph_eval_targets)
-
                 # computed tails [1, ?, word_dim]
                 computed_heads = tf.squeeze(self._transform_head_entity(eval_heads, reuse=True, device=device), axis=0)
 
                 # put pre-computed tails into target queue
                 # Call this to pre-compute tails for a certain relationship
-                pre_compute_tails = pre_computed_head_queue.enqueue_many(computed_heads, name='first_enqueue')
+                pre_compute_heads = pre_computed_head_queue.enqueue_many(computed_heads)
 
                 # get pre-computed tails from target queue
                 dequeue_op = pre_computed_head_queue.dequeue_many(ph_target_size)
@@ -1128,7 +1125,7 @@ class ContentModel(object):
                     re_enqueue = pre_computed_head_queue.enqueue_many(dequeue_op)
 
                 # Calculate heads and tails
-                computed_tails = self._transform_tail_entity(tails, reuse=True, device=device)
+                computed_tails = self._transform_head_entity(tails, reuse=True, device=device)
                 computed_rels = self._transform_relation(rels, reuse=True, device=device)
                 combined_head_rel = self._combine_head_relation(transformed_heads=head_embeds,
                                                                 transformed_rels=computed_rels,
@@ -1153,7 +1150,7 @@ class ContentModel(object):
 
                 return ph_tail_rel, ph_eval_targets, ph_target_size, pre_computed_head_queue.size(), \
                        ph_true_target_idx, ph_test_target_idx, \
-                       pre_compute_tails, re_enqueue, dequeue_op, ranks, rr, rand_ranks, rand_rr, pred_scores, top_10, top_10_score
+                       pre_compute_heads, re_enqueue, dequeue_op, ranks, rr, rand_ranks, rand_rr, pred_scores, top_10, top_10_score
 
     @staticmethod
     def eval_helper(scores, test_target_idx, true_target_idx):
@@ -1281,34 +1278,36 @@ def main(_):
 
     is_train = not FLAGS.eval
 
-    model = ContentModel(entity_file=os.path.join(dataset_dir, 'entities.txt'),
-                         relation_file=os.path.join(dataset_dir, 'relations.txt'),
-                         vocab_file=os.path.join(dataset_dir, 'vocab.txt'),
-                         word_embed_file=os.path.join(dataset_dir, 'embed.txt'),
-                         content_file=os.path.join(dataset_dir, 'descriptions.txt'),
-                         entity_title_file=os.path.join(dataset_dir, 'entity_names.txt'),
-                         relation_title_file=os.path.join(dataset_dir, 'relation_names.txt'),
-                         avoid_entity_file=os.path.join(dataset_dir, 'avoid_entities.txt'),
+    model = ContentAveragingModel(entity_file=os.path.join(dataset_dir, 'entities.txt'),
+                                  relation_file=os.path.join(dataset_dir, 'relations.txt'),
+                                  vocab_file=os.path.join(dataset_dir, 'vocab.txt'),
+                                  word_embed_file=os.path.join(dataset_dir, 'embed.txt'),
+                                  content_file=os.path.join(dataset_dir, 'descriptions.txt'),
+                                  entity_title_file=os.path.join(dataset_dir, 'entity_names.txt'),
+                                  relation_title_file=os.path.join(dataset_dir, 'relation_names.txt'),
+                                  avoid_entity_file=os.path.join(dataset_dir, 'avoid_entities.txt'),
 
-                         training_target_tail_file=os.path.join(dataset_dir, 'train.tails.values'),
-                         training_target_tail_key_file=os.path.join(dataset_dir, 'train.tails.idx'),
-                         training_target_head_file=os.path.join(dataset_dir, 'train.heads.values'),
-                         training_target_head_key_file=os.path.join(dataset_dir, 'train.heads.idx'),
+                                  training_target_tail_file=os.path.join(dataset_dir, 'train.tails.values'),
+                                  training_target_tail_key_file=os.path.join(dataset_dir, 'train.tails.idx'),
+                                  training_target_head_file=os.path.join(dataset_dir, 'train.heads.values'),
+                                  training_target_head_key_file=os.path.join(dataset_dir, 'train.heads.idx'),
 
-                         evaluation_open_target_tail_file=os.path.join(dataset_dir, 'eval.tails.values.open'),
-                         evaluation_closed_target_tail_file=os.path.join(dataset_dir, 'eval.tails.values.closed'),
-                         evaluation_target_tail_key_file=os.path.join(dataset_dir, 'eval.tails.idx'),
+                                  evaluation_open_target_tail_file=os.path.join(dataset_dir, 'eval.tails.values.open'),
+                                  evaluation_closed_target_tail_file=os.path.join(dataset_dir,
+                                                                                  'eval.tails.values.closed'),
+                                  evaluation_target_tail_key_file=os.path.join(dataset_dir, 'eval.tails.idx'),
 
-                         evaluation_open_target_head_file=os.path.join(dataset_dir, 'eval.heads.values.open'),
-                         evaluation_closed_target_head_file=os.path.join(dataset_dir, 'eval.heads.values.closed'),
-                         evaluation_target_head_key_file=os.path.join(dataset_dir, 'eval.heads.idx'),
+                                  evaluation_open_target_head_file=os.path.join(dataset_dir, 'eval.heads.values.open'),
+                                  evaluation_closed_target_head_file=os.path.join(dataset_dir,
+                                                                                  'eval.heads.values.closed'),
+                                  evaluation_target_head_key_file=os.path.join(dataset_dir, 'eval.heads.idx'),
 
-                         train_file=os.path.join(dataset_dir, 'train.txt'),
+                                  train_file=os.path.join(dataset_dir, 'train.txt'),
 
-                         word_oov=100,
-                         word_embedding_size=200,
-                         max_content_length=FLAGS.max_content,
-                         debug=True)
+                                  word_oov=100,
+                                  word_embedding_size=200,
+                                  max_content_length=FLAGS.max_content,
+                                  debug=True)
 
     model.create('/cpu:0')
     if is_train:
@@ -1317,10 +1316,6 @@ def main(_):
                                                        devices=['/gpu:0', '/gpu:1', '/gpu:2'])
     else:
         tf.logging.info("Evaluate mode")
-
-    # ph_head_rel, ph_eval_targets, ph_target_size, q_size, ph_true_target_idx, \
-    # ph_test_target_idx, pre_compute_tails, re_enqueue, dequeue_op, ranks, rr, rand_ranks, rand_rr, _ = model.manual_eval_tail_ops_v2(
-    #     '/gpu:3')
 
     ph_head_rel, ph_eval_targets, ph_target_size, q_size, ph_true_target_idx, \
     ph_test_target_idx, pre_compute_tails, re_enqueue, dequeue_op, ranks, rr, rand_ranks, rand_rr, _, top_10_id, top_10_score = model.manual_eval_tail_ops_v2(
@@ -1779,7 +1774,7 @@ def main(_):
             # sess.run(model.is_train.assign(True))
             return np.mean(all_ranks), all_ranks, np.mean(all_rr), np.mean(all_multi_rr)
 
-        def tail_eval_helper_old(is_test=True):
+        def eval_helper(is_test=True):
             # First load evaluation data
             # {rel : {head : [tails]}}
             eval_file = 'test.txt' if is_test else 'valid.txt'
@@ -1957,7 +1952,7 @@ def main(_):
                         print("Saving model@%d" % global_step)
                         saver.save(sess, os.path.join(CHECKPOINT_DIR, 'model.ckpt'), global_step=global_step)
                         print("Saved.")
-                        mr, r, mrr, triple_mrr = tail_eval_helper_old(FLAGS.force_eval)
+                        mr, r, mrr, triple_mrr = eval_helper(FLAGS.force_eval)
 
                         model.mean_rank.load(mr, sess)
                         model.mrr.load(mrr, sess)
@@ -1975,11 +1970,8 @@ def main(_):
             saver.save(sess, os.path.join(CHECKPOINT_DIR, "model.ckpt"), global_step=model.global_step)
             tf.logging.info("Model saved with %d global steps." % sess.run(model.global_step))
         else:
-            # tail_eval_helper_old()
-            tail_eval_helper(target_filter=True,
-                             closed=False)
-
-            head_eval_helper(target_filter=True, closed=False)
+            tail_eval_helper()
+            head_eval_helper()
 
 
 if __name__ == '__main__':
