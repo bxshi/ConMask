@@ -29,6 +29,8 @@ put the DB50 dataset under `ConMask/data`.
 
 Download pre-trained ConMask model from
 
+https://drive.google.com/file/d/1F6AMPhvGxy8MW3KQ8an2eCCNhikFeGB1/view?usp=sharing
+
 put the snapshot directly under `ConMask/`
 
 And use the following command under `ConMask/`:
