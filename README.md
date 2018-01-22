@@ -42,4 +42,4 @@ python3 -m ndkgc.models.fcn_model_v2 checkpoint_db50_v2_dr_uniweight_2 data/dbpe
 python3 -m ndkgc.models.fcn_model_v2 checkpoint_db50_v2_dr_uniweight_2 data/dbpedia50 --force_eval --layer 3 --conv 2 --lr 1e-2 --keep_prob 0.5 --max_content 512 --pos 1 --neg 4 --open --neval 5000 --eval --filter
 ``` 
 
-Please submit a GitHub issue if you have any further questions or inquiry bshi@nd.edu.
+Please submit a GitHub issue if you have any further questions or inquiry baoxu.shi@gmail.com.
