@@ -1,6 +1,6 @@
 # ConMask
 
-Code for AAAI'18 paper: Open-world Knowledge Graph Completion.
+Code for AAAI'18 paper: [Open-world Knowledge Graph Completion](https://arxiv.org/abs/1711.03438).
 
 The datasets and pre-trained models can be found at https://drive.google.com/open?id=1YBKw4nOnbscpDeTD_gWxfcpHRFG3MY20
 
