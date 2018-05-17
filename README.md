@@ -19,6 +19,8 @@ cmake --build .
 
 to compile the negative sampling operator using CMake and TensorFlow.
 
+**If you can not compile this C++ operator, please consider downgrade your TensorFlow to 1.3. PRs to fix this is welcomed.**
+
 ### Download per-trained model snapshot
 
 Download DB50 from 
