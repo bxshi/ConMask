@@ -23,13 +23,13 @@ to compile the negative sampling operator using CMake and TensorFlow.
 
 Download DB50 from 
 
-https://drive.google.com/file/d/1GnZsX_asVo65s96A28RLlk3V0rmiLOpx/view?usp=sharing
+https://drive.google.com/file/d/1qw8d0LGT18D_3p2_dNmyqztkgZO4ageW/view?usp=sharing
 
 put the DB50 dataset under `ConMask/data`.
 
 Download pre-trained ConMask model from
 
-https://drive.google.com/file/d/1F6AMPhvGxy8MW3KQ8an2eCCNhikFeGB1/view?usp=sharing
+https://drive.google.com/file/d/1OsSwP2LTHiPzP_gManIrjdAxUjj9nl8t/view?usp=sharing
 
 put the snapshot directly under `ConMask/`
 
@@ -41,5 +41,8 @@ python3 -m ndkgc.models.fcn_model_v2 checkpoint_db50_v2_dr_uniweight_2 data/dbpe
 # Open-World Evaluation
 python3 -m ndkgc.models.fcn_model_v2 checkpoint_db50_v2_dr_uniweight_2 data/dbpedia50 --force_eval --layer 3 --conv 2 --lr 1e-2 --keep_prob 0.5 --max_content 512 --pos 1 --neg 4 --open --neval 5000 --eval --filter
 ``` 
+
+You can also find the DB500 dataset at 
+https://drive.google.com/file/d/1Tx1gyMoj-9RkbdRvKzHYZ5EZmSrUywVF/view?usp=sharing
 
 Please submit a GitHub issue if you have any further questions or inquiry baoxu.shi@gmail.com.
